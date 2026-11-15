@@ -6,4 +6,5 @@ data/
 deploy/vlyra-linux
 *.md
 !README.md
-brand/
+brand/*
+!brand/vlyra-icon.svg

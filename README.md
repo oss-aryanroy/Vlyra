@@ -1,8 +1,12 @@
-# Vlyra
+<p align="center"><img src="brand/vlyra-icon.svg" width="96" height="96" alt=""></p>
 
-An open, self-hosted media server that other applications can contribute to, not
-just read from. One library, several protocols, and every client or integration
-is an **app** with its own permissions and an audit trail.
+<h1 align="center">Vlyra</h1>
+
+<p align="center">
+An open, self-hosted media server that other applications can contribute to, not just read
+from. One library, several protocols, and every client or integration is an <b>app</b> with
+its own permissions and an audit trail.
+</p>
 
 Written in [V](https://vlang.io); the web UI is plain HTML, CSS and JavaScript
 compiled into the binary. Licensed under the GPL-3.0 (see `LICENSE`).
