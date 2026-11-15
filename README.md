@@ -145,3 +145,35 @@ stored in `data/vlyra.db` and never returned by the API. A failed send is logged
 to stderr and not retried; the listen stays in Vlyra's history either way.
 Outbound HTTPS checks certificates against the system CA bundle (`SSL_CERT_FILE`
 to override).
+
+## Compared with Navidrome
+
+Same machine (Apple M5), same generated library of 10,000 tracks (1,000 albums,
+250 artists), Navidrome 0.64.2 against Vlyra's optimised build.
+
+| | Vlyra | Navidrome |
+| --- | --- | --- |
+| Binary | 3 MB | 66 MB |
+| First scan | 0.9 s | about 7 s |
+| Memory, idle after scan | 10 MB | 31 MB |
+| Memory after the load test | 69 MB | 87 MB |
+
+Subsonic requests, 3,000 each at 20 concurrent, no errors on either:
+
+| Request | Vlyra req/s (p99) | Navidrome req/s (p99) |
+| --- | --- | --- |
+| ping | 21,018 (4 ms) | 4,382 (18 ms) |
+| stream a 16 KB file | 18,006 (4 ms) | 3,587 (23 ms) |
+| getArtists | 473 (131 ms) | 898 (37 ms) |
+| album list, newest 50 | 289 (215 ms) | 2,430 (15 ms) |
+| album list, random 50 | 283 (210 ms) | 993 (34 ms) |
+| getAlbum | 875 (69 ms) | 2,312 (15 ms) |
+| search "harbour" | 328 (186 ms) | 356 (102 ms) |
+| 50 random songs | 696 (89 ms) | 623 (52 ms) |
+
+Vlyra groups albums and artists from tags on every request, with no stored
+album table or indexes, so Navidrome is faster on catalogue queries. Navidrome
+also returns more fields per item. The first scan was re-measured after Vlyra
+gained native tag readers (it was 211 s with one `ffprobe` per file); the other
+rows are from the first build. The test files are 2-second generated tones, over
+loopback, so streaming figures say nothing about large files.
