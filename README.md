@@ -49,8 +49,7 @@ with `--target source`.
 
 A protocol is a translation layer over `core.v`. To add one, add its name to
 `protocols` in `auth.v`, a `ProtocolInfo` line in `api.v`, and a file of routes
-that checks `app.protocol_on('name')`. Protocols are checked per request, so
-switching one on or off in Settings needs no restart.
+that checks `app.protocol_on('name')`.
 
 ## Apps and permissions
 
