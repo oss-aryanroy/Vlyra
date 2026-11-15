@@ -293,9 +293,8 @@ fn (app &App) jf_cover(id string) ?Item {
 }
 
 fn (app &App) jf_songs(where string, params []string, order string, start int, limit int) json2.Any {
-	total := app.db.exec_param_many('select count(*) from items where ${audio} ${where}', params) or {
-		return jf_page([], 0, start)
-	}
+	total := app.reader().exec_param_many('select count(*) from items where ${audio} ${where}',
+		params) or { return jf_page([], 0, start) }
 	mut all := params.clone()
 	all << [limit.str(), start.str()]
 	found := app.items('where ${audio} ${where} order by ${order} limit ? offset ?', all)
@@ -682,11 +681,8 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 			return jf_send(mut ctx, o)
 		}
 		if tail in ['similar', 'instantmix'] {
-			return jf_send(mut ctx, app.jf_songs('', [], 'random()', 0, if q['limit'].int() > 0 {
-				q['limit'].int()
-			} else {
-				50
-			}))
+			found := app.random_items(if q['limit'].int() > 0 { q['limit'].int() } else { 50 })
+			return jf_send(mut ctx, jf_page(found.map(app.jf_song(it)), found.len, 0))
 		}
 		if tail == 'lyrics' {
 			return ctx.redirect('/Audio/${id}/Lyrics')

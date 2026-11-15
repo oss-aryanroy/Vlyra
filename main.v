@@ -3,6 +3,8 @@ module main
 import db.sqlite
 import flag
 import os
+import runtime
+import sync.stdatomic
 import veb
 
 const version = '0.1.0'
@@ -18,6 +20,8 @@ pub struct Context {
 pub struct App {
 pub mut:
 	db       sqlite.DB
+	reads    []sqlite.DB
+	next     u64
 	data_dir string
 	ffprobe  string
 	ffmpeg   string
@@ -38,7 +42,24 @@ fn new_app(db_path string, data_dir string) !&App {
 		os.chmod(db_path, 0o600)!
 	}
 	app.migrate()!
+	if db_path != ':memory:' {
+		app.db.exec('pragma journal_mode = wal')!
+		app.db.exec('pragma synchronous = normal')!
+		for _ in 0 .. runtime.nr_cpus() {
+			mut r := sqlite.connect_full(db_path, [.readonly, .fullmutex], '')!
+			r.busy_timeout(5000)
+			app.reads << r
+		}
+	}
 	return app
+}
+
+// Reads spread over the pool so they run in parallel; writes stay on app.db.
+fn (app &App) reader() sqlite.DB {
+	if app.reads.len == 0 {
+		return app.db
+	}
+	return app.reads[stdatomic.add_u64(&app.next, 1) % u64(app.reads.len)]
 }
 
 @['/']

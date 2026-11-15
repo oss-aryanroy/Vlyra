@@ -149,31 +149,29 @@ to override).
 ## Compared with Navidrome
 
 Same machine (Apple M5), same generated library of 10,000 tracks (1,000 albums,
-250 artists), Navidrome 0.64.2 against Vlyra's optimised build.
+250 artists), Navidrome 0.64.2 against Vlyra's optimised build, measured back to
+back on the same day.
 
 | | Vlyra | Navidrome |
 | --- | --- | --- |
-| Binary | 3 MB | 66 MB |
-| First scan | 0.9 s | about 7 s |
-| Memory, idle after scan | 10 MB | 31 MB |
-| Memory after the load test | 69 MB | 87 MB |
+| Binary | 3.7 MB | 66 MB |
+| Start and first scan | 1.1 s | 11.2 s |
+| Memory, idle after scan | 32 MB | 64 MB |
+| Memory after the load test | 128 MB | 113 MB |
 
 Subsonic requests, 3,000 each at 20 concurrent, no errors on either:
 
 | Request | Vlyra req/s (p99) | Navidrome req/s (p99) |
 | --- | --- | --- |
-| ping | 21,018 (4 ms) | 4,382 (18 ms) |
-| stream a 16 KB file | 18,006 (4 ms) | 3,587 (23 ms) |
-| getArtists | 473 (131 ms) | 898 (37 ms) |
-| album list, newest 50 | 289 (215 ms) | 2,430 (15 ms) |
-| album list, random 50 | 283 (210 ms) | 993 (34 ms) |
-| getAlbum | 875 (69 ms) | 2,312 (15 ms) |
-| search "harbour" | 328 (186 ms) | 356 (102 ms) |
-| 50 random songs | 696 (89 ms) | 623 (52 ms) |
+| ping | 22,562 (3 ms) | 3,727 (21 ms) |
+| stream a 16 KB file | 19,850 (3 ms) | 2,283 (31 ms) |
+| getArtists | 1,586 (40 ms) | 547 (60 ms) |
+| album list, newest 50 | 1,850 (35 ms) | 1,533 (26 ms) |
+| album list, random 50 | 1,540 (42 ms) | 706 (48 ms) |
+| getAlbum | 4,141 (15 ms) | 1,630 (22 ms) |
+| search "harbour" | 876 (71 ms) | 275 (129 ms) |
+| 50 random songs | 849 (74 ms) | 475 (73 ms) |
 
-Vlyra groups albums and artists from tags on every request, with no stored
-album table or indexes, so Navidrome is faster on catalogue queries. Navidrome
-also returns more fields per item. The first scan was re-measured after Vlyra
-gained native tag readers (it was 211 s with one `ffprobe` per file); the other
-rows are from the first build. The test files are 2-second generated tones, over
-loopback, so streaming figures say nothing about large files.
+Navidrome returns more fields per item, so its responses are larger. The test
+files are 2-second generated tones, over loopback, so streaming figures say
+nothing about large files.

@@ -248,3 +248,29 @@ fn test_scrobble_payloads() {
 	app.record_play(Principal{ name: 'player' }, 1, 0)!
 	assert app.db.q_int('select count(*) from plays')! == 1
 }
+
+fn test_random_items() {
+	mut app := new_app(':memory:', os.temp_dir())!
+	for i in 0 .. 40 {
+		it := Item{
+			path:  '/m/${i}.mp3'
+			kind:  if i % 10 == 0 { 'video' } else { 'audio' }
+			title: 't${i}'
+		}
+		sql app.db {
+			insert it into Item
+		}!
+	}
+	got := app.random_items(10)
+	assert got.len == 10
+	assert got.all(it.kind == 'audio')
+	mut seen := map[int]bool{}
+	for it in got {
+		assert it.id !in seen
+		seen[it.id] = true
+	}
+	// More than the library holds: every audio track once, via the fallback.
+	all := app.random_items(100)
+	assert all.len == 36
+	assert app.random_items(0).len == 0
+}

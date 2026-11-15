@@ -1,6 +1,7 @@
 module main
 
 import db.sqlite
+import rand
 import time
 
 @[table: 'items']
@@ -94,6 +95,9 @@ fn (mut app App) migrate() ! {
 	app.db.exec('alter table items add column mtime integer not null default 0') or {}
 	app.db.exec("alter table items add column album_artist text not null default ''") or {}
 	app.db.exec("update items set album_artist = artist where album_artist = ''")!
+	// Cover the album and artist aggregates, so grouping reads the index alone.
+	app.db.exec('create index if not exists items_album on items (album_artist, album, missing, kind, duration, year, genre, added_at)')!
+	app.db.exec('create index if not exists items_artist on items (artist, album, missing, kind)')!
 }
 
 fn (app &App) get(key string) string {
@@ -131,11 +135,36 @@ fn item_from(r sqlite.Row) Item {
 
 // `tail` must be a code constant; user input only ever goes in `params`.
 fn (app &App) items(tail string, params []string) []Item {
-	rows := app.db.exec_param_many('select ${item_cols} from items ${tail}', params) or {
+	rows := app.reader().exec_param_many('select ${item_cols} from items ${tail}', params) or {
 		eprintln('items: ${err}')
 		return []
 	}
 	return rows.map(item_from(it))
+}
+
+// Ids are drawn here, not with ORDER BY random(): SQLite's random() takes a
+// process-wide lock per row, which stalls parallel requests.
+fn (app &App) random_items(n int) []Item {
+	top := app.reader().q_int('select max(id) from items') or { 0 }
+	if top <= 0 || n <= 0 {
+		return []
+	}
+	mut ids := []string{cap: n * 3}
+	for _ in 0 .. n * 3 {
+		ids << (rand.intn(top) or { 0 } + 1).str()
+	}
+	mut found := app.items('where ${audio} and id in (${ids.map('?').join(',')})', ids)
+	if found.len < n {
+		found = app.items('where ${audio} order by random() limit ?', [
+			n.str(),
+		])
+	}
+	rand.shuffle(mut found) or {}
+	return found[..if found.len < n {
+		found.len
+	} else {
+		n
+	}]
 }
 
 fn (app &App) item(id int) ?Item {
@@ -170,7 +199,7 @@ const album_match = 'album_artist = ? and album = ?'
 
 // `tail` must be a code constant.
 fn (app &App) album_rows(tail string, params []string) []Album {
-	rows := app.db.exec_param_many('select album_artist, album, count(*), sum(duration), max(year), max(genre), min(id), max(added_at), coalesce((select rating from album_ratings r where r.album_artist = items.album_artist and r.album = items.album), 0) as rating from items where ${audio} ${tail}',
+	rows := app.reader().exec_param_many('select album_artist, album, count(*), sum(duration), max(year), max(genre), min(id), max(added_at), coalesce((select rating from album_ratings r where r.album_artist = items.album_artist and r.album = items.album), 0) as rating from items where ${audio} ${tail}',
 		params) or {
 		eprintln('albums: ${err}')
 		return []
@@ -190,7 +219,7 @@ fn (app &App) album_rows(tail string, params []string) []Album {
 
 // `tail` must be a code constant.
 fn (app &App) artist_rows(tail string, params []string) []ArtistRow {
-	rows := app.db.exec_param_many('select artist, count(distinct album), min(id) from items where ${audio} ${tail}',
+	rows := app.reader().exec_param_many('select artist, count(distinct album), min(id) from items where ${audio} ${tail}',
 		params) or {
 		eprintln('artists: ${err}')
 		return []

@@ -160,7 +160,7 @@ fn (app &App) albums(rated bool, tail string, params []string) []json2.Any {
 }
 
 fn (app &App) artist_index() []json2.Any {
-	rows := app.db.exec('select artist, count(distinct album), min(id) from items where ${audio} group by artist order by artist collate nocase') or {
+	rows := app.reader().exec('select artist, count(distinct album), min(id) from items where ${audio} group by artist order by artist collate nocase') or {
 		return []
 	}
 	mut letters := []string{}
@@ -472,9 +472,7 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		}
 		'getRandomSongs' {
 			mut r := map[string]json2.Any{}
-			r['song'] = songs(app.items('where ${audio} order by random() limit ?', [
-				int_param(q, 'size', 10, 500).str(),
-			]))
+			r['song'] = songs(app.random_items(int_param(q, 'size', 10, 500)))
 			out['randomSongs'] = r
 		}
 		'getStarred', 'getStarred2' {
@@ -498,7 +496,7 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 				int_param(q, 'albumCount', 20, 500).str(),
 				int_param(q, 'albumOffset', 0, max_int).str(),
 			])
-			artist_rows := app.db.exec_param_many('select artist, count(distinct album), min(id) from items where ${audio} and artist like ?1 group by artist order by artist collate nocase limit ?2 offset ?3', [
+			artist_rows := app.reader().exec_param_many('select artist, count(distinct album), min(id) from items where ${audio} and artist like ?1 group by artist order by artist collate nocase limit ?2 offset ?3', [
 				pattern,
 				int_param(q, 'artistCount', 20, 500).str(),
 				int_param(q, 'artistOffset', 0, max_int).str(),
