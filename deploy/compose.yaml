@@ -1,0 +1,11 @@
+services:
+  vlyra:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    user: "1000:1000"
+    restart: unless-stopped
+    command: ["--port", "4040"]
+    ports:
+      - "127.0.0.1:${VLYRA_PORT:-4533}:4040"
+    volumes:
+      - ./data:/data
+      - /srv/music:/music:ro

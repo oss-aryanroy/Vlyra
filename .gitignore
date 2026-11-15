@@ -1,0 +1,9 @@
+vlyra
+data/
+*.dSYM/
+.playwright-mcp/
+.impeccable/
+deploy/vlyra-linux
+*.md
+!README.md
+brand/

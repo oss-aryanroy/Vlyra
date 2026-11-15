@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#131210">
+<title>Vlyra</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22 fill=%22none%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22 role=%22img%22 aria-label=%22Vlyra%22%3E%3Crect width=%2264%22 height=%2264%22 rx=%2214%22 fill=%22%23141210%22/%3E%3Cg transform=%22translate(9 8.5) scale(0.72)%22%3E%3Cpath d=%22M25 25V35.5M32 25V47M39 25V35.5%22 stroke=%22%23f0f0ea%22 stroke-width=%222.2%22/%3E%3Cpath d=%22M7.5 11.5C12 12.5 15 16.5 17 21.5L32 55L47 21.5C49 16.5 52 12.5 56.5 11.5%22 stroke=%22%23f2b84b%22 stroke-width=%225.5%22/%3E%3Cpath d=%22M11 25H53%22 stroke=%22%23f2b84b%22 stroke-width=%223.5%22/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<main id="auth" hidden>
+  <form id="auth-form">
+    <h1 class="wordmark"><svg class="mark" viewBox="0 0 64 64" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M25 25V35.5M32 25V47M39 25V35.5" stroke="currentColor" stroke-width="1.75"/><path d="M7.5 11.5C12 12.5 15 16.5 17 21.5L32 55L47 21.5C49 16.5 52 12.5 56.5 11.5" stroke="var(--accent)" stroke-width="5.5"/><path d="M11 25H53" stroke="var(--accent)" stroke-width="3.5"/></svg>Vlyra</h1>
+    <p id="auth-intro"></p>
+    <label>Password
+      <input id="auth-password" type="password" required minlength="8" autocomplete="current-password">
+    </label>
+    <label id="auth-confirm-row" hidden>Repeat password
+      <input id="auth-confirm" type="password" minlength="8" autocomplete="new-password">
+    </label>
+    <button class="primary" id="auth-submit"></button>
+  </form>
+</main>
+
+<div id="shell" hidden>
+  <nav id="rail" aria-label="Main">
+    <a class="wordmark" href="#/library"><svg class="mark" viewBox="0 0 64 64" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M25 25V35.5M32 25V47M39 25V35.5" stroke="currentColor" stroke-width="1.75"/><path d="M7.5 11.5C12 12.5 15 16.5 17 21.5L32 55L47 21.5C49 16.5 52 12.5 56.5 11.5" stroke="var(--accent)" stroke-width="5.5"/><path d="M11 25H53" stroke="var(--accent)" stroke-width="3.5"/></svg>Vlyra</a>
+    <div class="nav-group">
+      <a href="#/library" data-icon="library">Library</a>
+      <a href="#/playlists" data-icon="playlist">Playlists</a>
+      <a href="#/history" data-icon="history">History</a>
+    </div>
+    <div class="nav-group">
+      <span class="nav-label">Server</span>
+      <a href="#/apps" data-icon="apps">Apps</a>
+      <a href="#/activity" data-icon="activity">Activity</a>
+      <a href="#/settings" data-icon="settings">Settings</a>
+    </div>
+    <button id="signout" class="ghost" data-icon="signout">Sign out</button>
+  </nav>
+
+  <main id="view" tabindex="-1"></main>
+  <aside id="panel" aria-label="Track details" hidden></aside>
+
+  <footer id="player" hidden>
+    <a id="now" href="#/library">
+      <span id="now-art"></span>
+      <span id="now-text"><strong id="now-title"></strong><span id="now-artist"></span></span>
+    </a>
+    <div id="transport">
+      <div id="buttons">
+        <button id="prev" class="icon" aria-label="Previous track"></button>
+        <button id="toggle" class="icon play" aria-label="Play"></button>
+        <button id="next" class="icon" aria-label="Next track"></button>
+      </div>
+      <div id="scrub">
+        <span id="time-now">0:00</span>
+        <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
+        <span id="time-total">0:00</span>
+      </div>
+    </div>
+    <div id="volume-box">
+      <span id="volume-icon"></span>
+      <input id="volume" type="range" min="0" max="100" value="100" aria-label="Volume">
+    </div>
+    <audio id="audio" preload="metadata"></audio>
+  </footer>
+</div>
+
+<dialog id="dialog"></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
