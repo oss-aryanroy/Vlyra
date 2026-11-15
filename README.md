@@ -142,10 +142,3 @@ stored in `data/vlyra.db` and never returned by the API. A failed send is logged
 to stderr and not retried; the listen stays in Vlyra's history either way.
 Outbound HTTPS checks certificates against the system CA bundle (`SSL_CERT_FILE`
 to override).
-
-## Not built yet
-
-- DLNA/UPnP; Jellyfin video, favourites and transcoding
-- Transcoding (files are streamed as stored), stars, song and artist ratings
-- Multiple media folders, multiple human users
-- TLS: put Vlyra behind a reverse proxy (Caddy, nginx) if it leaves your LAN
