@@ -2,6 +2,7 @@ module main
 
 import crypto.bcrypt
 import crypto.sha256
+import net
 import net.http
 import os
 import rand
@@ -9,7 +10,6 @@ import time
 import veb
 import x.json2
 
-const range_chunk = i64(4 * 1024 * 1024)
 const max_artwork = 10 * 1024 * 1024
 
 fn fail(mut ctx Context, status http.Status, msg string) veb.Result {
@@ -61,18 +61,39 @@ fn serve_media(mut ctx Context, path string) veb.Result {
 		ctx.set_header(.content_range, 'bytes */${size}')
 		return fail(mut ctx, .requested_range_not_satisfiable, 'bad range')
 	}
-	if end > start + range_chunk - 1 {
-		end = start + range_chunk - 1
-	}
 	if end > size - 1 {
 		end = size - 1
 	}
-	mut f := os.open(path) or { return fail(mut ctx, .not_found, 'cannot open file') }
-	data := f.read_bytes_at(int(end - start + 1), u64(start))
-	f.close()
-	ctx.res.set_status(.partial_content)
-	ctx.set_header(.content_range, 'bytes ${start}-${end}/${size}')
-	return ctx.send_response_to_client(mime, data.bytestr())
+	// veb can only send whole files, so a range is streamed from disk on its own
+	// thread; holding it in memory made memory grow with every listener.
+	ctx.takeover_conn()
+	spawn stream_range(mut ctx.conn, path, mime, start, end, size)
+	return veb.no_result()
+}
+
+fn stream_range(mut conn net.TcpConn, path string, mime string, start i64, end i64, size i64) {
+	defer {
+		conn.close() or {}
+	}
+	mut f := os.open(path) or { return }
+	defer {
+		f.close()
+	}
+	conn.write_string('HTTP/1.1 206 Partial Content\r\nContent-Type: ${mime}\r\nContent-Length: ${
+		end - start + 1}\r\nContent-Range: bytes ${start}-${end}/${size}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n') or {
+		return
+	}
+	mut buf := []u8{len: 64 * 1024}
+	mut pos := start
+	for pos <= end {
+		n := f.read_bytes_into(u64(pos), mut buf) or { return }
+		if n <= 0 {
+			return
+		}
+		want := if i64(n) > end - pos + 1 { int(end - pos + 1) } else { n }
+		conn.write(buf[..want]) or { return }
+		pos += want
+	}
 }
 
 fn image_mime(data string) string {
