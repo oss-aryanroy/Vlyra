@@ -704,7 +704,7 @@ async function settingsView(render) {
           ['Last.fm needs an API account of your own: ', outside('https://www.last.fm/api/account/create', 'create one'), ' (leave the callback URL empty), then enter its key and secret.'],
           h('form', { class: 'stack', onsubmit: connectLastfm }, h('div', { class: 'two' }, lfKey, lfSecret), h('div', { class: 'row' }, h('button', { class: 'primary' }, 'Connect'))))),
       h('div', { class: 'section' },
-        h('div', { class: 'head' }, h('p', {}, `Vlyra ${s.version} · free software under the GPL-2.0 licence.`),
+        h('div', { class: 'head' }, h('p', {}, `Vlyra ${s.version} · free software under the GPL-3.0 licence.`),
           h('button', { onclick: () => $('#signout').click() }, 'Sign out')))));
   if (s.scanning) setTimeout(() => location.hash === '#/settings' && route(), 1500);
 }

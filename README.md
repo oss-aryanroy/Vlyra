@@ -5,7 +5,7 @@ just read from. One library, several protocols, and every client or integration
 is an **app** with its own permissions and an audit trail.
 
 Written in [V](https://vlang.io); the web UI is plain HTML, CSS and JavaScript
-compiled into the binary. Licensed under the GPL-2.0 (see `LICENSE`).
+compiled into the binary. Licensed under the GPL-3.0 (see `LICENSE`).
 
 ## Run
 
