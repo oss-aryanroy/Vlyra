@@ -152,6 +152,13 @@ fn test_rescan_keeps_edits() {
 	it := app.item(id) or { panic('gone') }
 	assert it.title == 'Mine'
 	assert it.artist == 'After'
+	assert it.added_at == file_added(song)
+
+	// Old databases stamped added_at with the scan time; the backfill corrects it.
+	app.db.exec_param('update items set added_at = 2000000000 where id = ?', id.str())!
+	app.set('added_from_files', '')
+	app.scan()
+	assert app.item(id)?.added_at == file_added(song)
 }
 
 fn test_albums_group_by_album_artist() {

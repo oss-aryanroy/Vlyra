@@ -28,6 +28,41 @@ const media_types = {
 	'.mov':  'video/quicktime'
 }
 
+#flag linux -D_GNU_SOURCE
+#include <sys/stat.h>
+#include <fcntl.h>
+
+struct C.statx_timestamp {
+	tv_sec i64
+}
+
+struct C.statx {
+	stx_mask  u32
+	stx_btime C.statx_timestamp
+}
+
+fn C.statx(dirfd int, path &char, flags int, mask u32, buf &C.statx) int
+
+// When the file arrived on this disk: its birth time where the filesystem
+// records one, else its mtime. Never later than now (bad clocks, future mtimes).
+fn file_added(path string) i64 {
+	mut t := os.file_last_mod_unix(path)
+	$if linux {
+		mut sx := C.statx{}
+		if C.statx(C.AT_FDCWD, &char(path.str), 0, C.STATX_BTIME, &sx) == 0
+			&& sx.stx_mask & C.STATX_BTIME != 0 && sx.stx_btime.tv_sec > 0 {
+			t = sx.stx_btime.tv_sec
+		}
+	} $else $if macos {
+		mut st := C.stat{}
+		if unsafe { C.stat(&char(path.str), &st) } == 0 && st.st_birthtime > 0 {
+			t = st.st_birthtime
+		}
+	}
+	now := time.now().unix()
+	return if t > 0 && t < now { t } else { now }
+}
+
 // os.exec, not os.Process: Process forks and runs V code in the child, which
 // deadlocks if another thread held the allocator lock at that moment.
 fn run(exe string, args []string) string {
@@ -43,7 +78,7 @@ fn probe_file(ffprobe string, path string) Item {
 		kind:     if media_types[ext].starts_with('video') { 'video' } else { 'audio' }
 		title:    os.file_name(path).all_before_last('.')
 		size:     i64(os.file_size(path))
-		added_at: time.now().unix()
+		added_at: file_added(path)
 		mtime:    os.file_last_mod_unix(path)
 	}
 	if it.kind == 'audio' {
@@ -225,6 +260,20 @@ fn (mut app App) scan() {
 	}
 	if reread_all {
 		app.set('tags_version', tag_reader_version)
+	}
+	// Rows scanned before file_added existed carry their scan time; fix them once.
+	if app.get('added_from_files') == '' {
+		app.db.exec('begin') or {}
+		for path, _ in seen {
+			if path in known {
+				app.db.exec_param_many('update items set added_at = ? where path = ?', [
+					file_added(path).str(),
+					path,
+				]) or { eprintln('scan: ${path}: ${err}') }
+			}
+		}
+		app.db.exec('commit') or { eprintln('scan: ${err}') }
+		app.set('added_from_files', '1')
 	}
 	for path, _ in seen {
 		if path in known && known[path] {
