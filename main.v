@@ -1,9 +1,11 @@
 module main
 
+import crypto.md5
 import db.sqlite
 import flag
 import os
 import runtime
+import sync
 import sync.stdatomic
 import veb
 
@@ -17,40 +19,80 @@ pub struct Context {
 	veb.Context
 }
 
+pub struct AppCache {
+pub mut:
+	mu            sync.RwMutex
+	tx_mu         sync.Mutex
+	settings      map[string]string
+	apps_by_token map[string]ClientApp
+	apps_by_name  map[string]ClientApp
+	last_seen     map[int]i64
+	last_seen_db  map[int]i64
+	has_ratings   bool
+}
+
 pub struct App {
 pub mut:
-	db       sqlite.DB
-	reads    []sqlite.DB
-	next     u64
-	data_dir string
-	ffprobe  string
-	ffmpeg   string
-	scanning bool
+	db        sqlite.DB
+	reads     []sqlite.DB
+	next      u64
+	data_dir  string
+	ffprobe   string
+	ffmpeg    string
+	scanning  bool
+	cache     &AppCache = unsafe { nil }
+	server_id string
+	web_html  string
+	web_css_s string
+	web_js_s  string
 }
 
 fn new_app(db_path string, data_dir string) !&App {
+	mut c := &AppCache{}
+	c.mu.init()
+	c.tx_mu.init()
 	mut app := &App{
 		// fullmutex: veb serves requests on several threads over this one connection.
-		db:       sqlite.connect_full(db_path, [.readwrite, .create, .fullmutex], '')!
-		data_dir: data_dir
-		ffprobe:  os.find_abs_path_of_executable('ffprobe') or { '' }
-		ffmpeg:   os.find_abs_path_of_executable('ffmpeg') or { '' }
+		db:        sqlite.connect_full(db_path, [.readwrite, .create, .fullmutex], '')!
+		data_dir:  data_dir
+		ffprobe:   os.find_abs_path_of_executable('ffprobe') or { '' }
+		ffmpeg:    os.find_abs_path_of_executable('ffmpeg') or { '' }
+		cache:     c
+		server_id: md5.hexhash('vlyra\x1f${data_dir}')
+		web_html:  web_index.to_string()
+		web_css_s: web_css.to_string()
+		web_js_s:  web_js.to_string()
 	}
 	app.db.busy_timeout(5000)
 	if db_path != ':memory:' {
+		app.db.exec('pragma journal_mode = wal')!
+		app.db.exec('pragma synchronous = normal')!
+		app.db.exec('pragma temp_store = memory')!
+		app.db.exec('pragma mmap_size = 268435456')!
+		app.db.exec('pragma cache_size = -16000')!
 		// It holds Subsonic passwords.
 		os.chmod(db_path, 0o600)!
 	}
 	app.migrate()!
 	if db_path != ':memory:' {
-		app.db.exec('pragma journal_mode = wal')!
-		app.db.exec('pragma synchronous = normal')!
-		for _ in 0 .. runtime.nr_cpus() {
+		// Ensure the WAL -shm index exists before opening readonly connections.
+		app.db.exec('select 1 from sqlite_master limit 1')!
+		n := if runtime.nr_cpus() * 2 > 4 { runtime.nr_cpus() * 2 } else { 4 }
+		for _ in 0 .. n {
 			mut r := sqlite.connect_full(db_path, [.readonly, .fullmutex], '')!
 			r.busy_timeout(5000)
+			r.exec('pragma query_only = on')!
+			r.exec('pragma temp_store = memory')!
+			r.exec('pragma mmap_size = 268435456')!
+			r.exec('pragma cache_size = -4000')!
 			app.reads << r
 		}
+		app.db.exec('pragma optimize') or {}
 	}
+	app.ensure_catalog_ready()
+	app.reload_settings()
+	app.reload_apps()
+	app.reload_ratings_flag()
 	return app
 }
 
@@ -64,17 +106,17 @@ fn (app &App) reader() sqlite.DB {
 
 @['/']
 pub fn (mut app App) index(mut ctx Context) veb.Result {
-	return ctx.html(web_index.to_string())
+	return ctx.html(app.web_html)
 }
 
 @['/app.css']
 pub fn (mut app App) css(mut ctx Context) veb.Result {
-	return ctx.send_response_to_client('text/css', web_css.to_string())
+	return ctx.send_response_to_client('text/css', app.web_css_s)
 }
 
 @['/app.js']
 pub fn (mut app App) js(mut ctx Context) veb.Result {
-	return ctx.send_response_to_client('text/javascript', web_js.to_string())
+	return ctx.send_response_to_client('text/javascript', app.web_js_s)
 }
 
 fn main() {

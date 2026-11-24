@@ -103,21 +103,373 @@ fn sub_error(mut ctx Context, q urllib.Values, code int, message string) veb.Res
 	return sub_reply(mut ctx, q, payload)
 }
 
+const sub_index_letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ#'
+
+fn sub_write_open(mut j JsonBuf, key string) {
+	j.raw('{"subsonic-response":{"status":"ok","version":"1.16.1","type":"vlyra","serverVersion":"')
+	j.raw(version)
+	j.raw('","openSubsonic":true,"')
+	j.raw(key)
+	j.raw('":')
+}
+
+fn sub_write_song(mut j JsonBuf, it &Item) {
+	ext := os.file_ext(it.path).to_lower()
+	al_id := album_id(it.album_artist, it.album)
+	j.raw('{"id":"')
+	j.jint(it.id)
+	j.raw('","parent":')
+	j.jstr(al_id)
+	j.raw(',"isDir":false,"title":')
+	j.jstr(it.title)
+	j.raw(',"album":')
+	j.jstr(or_unknown(it.album, 'Album'))
+	j.raw(',"artist":')
+	j.jstr(or_unknown(it.artist, 'Artist'))
+	j.raw(',"albumId":')
+	j.jstr(al_id)
+	j.raw(',"artistId":')
+	j.jstr(artist_id(it.artist))
+	j.raw(',"track":')
+	j.jint(it.track_no)
+	j.raw(',"year":')
+	j.jint(it.year)
+	j.raw(',"genre":')
+	j.jstr(it.genre)
+	j.raw(',"coverArt":"')
+	j.jint(it.id)
+	j.raw('","size":')
+	j.jint(it.size)
+	j.raw(',"contentType":')
+	j.jstr(media_types[ext])
+	j.raw(',"suffix":')
+	j.jstr(ext.trim_left('.'))
+	j.raw(',"duration":')
+	j.jint(it.duration)
+	j.raw(',"path":')
+	j.jstr(os.file_name(it.path))
+	j.raw(',"type":"music","isVideo":false,"created":')
+	j.jstr(iso(it.added_at))
+	if it.play_count > 0 {
+		j.raw(',"playCount":')
+		j.jint(it.play_count)
+	}
+	if it.last_played > 0 {
+		j.raw(',"played":')
+		j.jstr(iso(it.last_played))
+	}
+	j.byte(`}`)
+}
+
+fn sub_write_album_fields(mut j JsonBuf, al &Album, rated bool) {
+	ar_id := artist_id(al.artist)
+	al_name := or_unknown(al.name, 'Album')
+	j.raw('{"id":')
+	j.jstr(album_id(al.artist, al.name))
+	j.raw(',"parent":')
+	j.jstr(ar_id)
+	j.raw(',"isDir":true,"name":')
+	j.jstr(al_name)
+	j.raw(',"title":')
+	j.jstr(al_name)
+	j.raw(',"album":')
+	j.jstr(al_name)
+	j.raw(',"artist":')
+	j.jstr(or_unknown(al.artist, 'Artist'))
+	j.raw(',"artistId":')
+	j.jstr(ar_id)
+	j.raw(',"songCount":')
+	j.jint(al.songs)
+	j.raw(',"duration":')
+	j.jint(al.duration)
+	j.raw(',"year":')
+	j.jint(al.year)
+	j.raw(',"genre":')
+	j.jstr(al.genre)
+	j.raw(',"coverArt":"')
+	j.jint(al.first_id)
+	j.raw('","created":')
+	j.jstr(iso(al.added_at))
+	if rated && al.rating > 0 {
+		j.raw(',"userRating":')
+		j.jint(al.rating)
+	}
+	if al.play_count > 0 {
+		j.raw(',"playCount":')
+		j.jint(al.play_count)
+	}
+	if al.last_played > 0 {
+		j.raw(',"played":')
+		j.jstr(iso(al.last_played))
+	}
+}
+
+fn sub_write_artist(mut j JsonBuf, r &ArtistRow) {
+	j.raw('{"id":')
+	j.jstr(artist_id(r.name))
+	j.raw(',"name":')
+	j.jstr(or_unknown(r.name, 'Artist'))
+	j.raw(',"albumCount":')
+	j.jint(r.albums)
+	j.raw(',"coverArt":"')
+	j.jint(r.first_id)
+	j.raw('"}')
+}
+
+fn encode_sub_artists_json(rows &[]ArtistRow, is_artists bool) string {
+	mut buckets := [27][]int{}
+	mut order := []int{cap: 27}
+	for i := 0; i < rows.len; i++ {
+		r := unsafe { &(*rows)[i] }
+		name := or_unknown(r.name, 'Artist')
+		c := name[0]
+		b := if c >= `A` && c <= `Z` {
+			int(c - `A`)
+		} else if c >= `a` && c <= `z` {
+			int(c - `a`)
+		} else {
+			26
+		}
+		if buckets[b].len == 0 {
+			order << b
+		}
+		buckets[b] << i
+	}
+	mut j := new_jbuf(rows.len * 84 + 1024)
+	sub_write_open(mut j, if is_artists { 'artists' } else { 'indexes' })
+	j.raw('{"ignoredArticles":"","index":[')
+	for oi, b in order {
+		if oi > 0 {
+			j.byte(`,`)
+		}
+		j.raw('{"name":"')
+		j.byte(sub_index_letters[b])
+		j.raw('","artist":[')
+		for k := 0; k < buckets[b].len; k++ {
+			if k > 0 {
+				j.byte(`,`)
+			}
+			ri := buckets[b][k]
+			r := unsafe { &(*rows)[ri] }
+			sub_write_artist(mut j, r)
+		}
+		j.raw(']}')
+	}
+	j.raw(']}}}')
+	return j.finish()
+}
+
+fn encode_sub_album_list_json(list &[]Album, rated bool, is_v1 bool) string {
+	mut j := new_jbuf(list.len * 380 + 256)
+	sub_write_open(mut j, if is_v1 { 'albumList' } else { 'albumList2' })
+	j.raw('{"album":[')
+	for i := 0; i < list.len; i++ {
+		if i > 0 {
+			j.byte(`,`)
+		}
+		al := unsafe { &(*list)[i] }
+		sub_write_album_fields(mut j, al, rated)
+		j.byte(`}`)
+	}
+	j.raw(']}}}')
+	return j.finish()
+}
+
+fn encode_sub_album_detail_json(al &Album, tracks &[]Item, rated bool) string {
+	mut j := new_jbuf(tracks.len * 420 + 512)
+	sub_write_open(mut j, 'album')
+	sub_write_album_fields(mut j, al, rated)
+	j.raw(',"song":[')
+	for i := 0; i < tracks.len; i++ {
+		if i > 0 {
+			j.byte(`,`)
+		}
+		it := unsafe { &(*tracks)[i] }
+		sub_write_song(mut j, it)
+	}
+	j.raw(']}}}')
+	return j.finish()
+}
+
+fn encode_sub_genres_json(rows &[]GenreRow) string {
+	mut j := new_jbuf(rows.len * 64 + 192)
+	sub_write_open(mut j, 'genres')
+	j.raw('{"genre":[')
+	for i := 0; i < rows.len; i++ {
+		if i > 0 {
+			j.byte(`,`)
+		}
+		gr := unsafe { &(*rows)[i] }
+		j.raw('{"value":')
+		j.jstr(gr.name)
+		j.raw(',"songCount":')
+		j.jint(gr.songs)
+		j.raw(',"albumCount":')
+		j.jint(gr.albums)
+		j.byte(`}`)
+	}
+	j.raw(']}}}')
+	return j.finish()
+}
+
+fn encode_sub_random_songs_json(items &[]Item) string {
+	mut j := new_jbuf(items.len * 420 + 256)
+	sub_write_open(mut j, 'randomSongs')
+	j.raw('{"song":[')
+	for i := 0; i < items.len; i++ {
+		if i > 0 {
+			j.byte(`,`)
+		}
+		it := unsafe { &(*items)[i] }
+		sub_write_song(mut j, it)
+	}
+	j.raw(']}}}')
+	return j.finish()
+}
+
+fn encode_sub_playlists_json(sums &[]PlaylistSummary) string {
+	mut j := new_jbuf(sums.len * 160 + 256)
+	sub_write_open(mut j, 'playlists')
+	j.raw('{"playlist":[')
+	for i := 0; i < sums.len; i++ {
+		if i > 0 {
+			j.byte(`,`)
+		}
+		ps := unsafe { &(*sums)[i] }
+		ts := iso(ps.created_at)
+		j.raw('{"id":"')
+		j.jint(ps.id)
+		j.raw('","name":')
+		j.jstr(ps.name)
+		j.raw(',"owner":')
+		j.jstr(ps.owner)
+		j.raw(',"public":true,"songCount":')
+		j.jint(ps.songs)
+		j.raw(',"duration":')
+		j.jint(ps.duration)
+		j.raw(',"created":')
+		j.jstr(ts)
+		j.raw(',"changed":')
+		j.jstr(ts)
+		j.byte(`}`)
+	}
+	j.raw(']}}}')
+	return j.finish()
+}
+
+fn encode_sub_search_json(song_rows &[]Item, album_rows &[]Album, artist_rows &[]ArtistRow, rated bool, is_v2 bool) string {
+	mut j := new_jbuf(song_rows.len * 420 + album_rows.len * 380 + artist_rows.len * 84 + 256)
+	sub_write_open(mut j, if is_v2 { 'searchResult2' } else { 'searchResult3' })
+	j.raw('{"song":[')
+	for i := 0; i < song_rows.len; i++ {
+		if i > 0 {
+			j.byte(`,`)
+		}
+		it := unsafe { &(*song_rows)[i] }
+		sub_write_song(mut j, it)
+	}
+	j.raw('],"album":[')
+	for i := 0; i < album_rows.len; i++ {
+		if i > 0 {
+			j.byte(`,`)
+		}
+		al := unsafe { &(*album_rows)[i] }
+		sub_write_album_fields(mut j, al, rated)
+		j.byte(`}`)
+	}
+	j.raw('],"artist":[')
+	for i := 0; i < artist_rows.len; i++ {
+		if i > 0 {
+			j.byte(`,`)
+		}
+		r := unsafe { &(*artist_rows)[i] }
+		sub_write_artist(mut j, r)
+	}
+	j.raw(']}}}')
+	return j.finish()
+}
+
+fn (app &App) sub_album_list(rated bool, q urllib.Values) []Album {
+	kind := q.get('type') or { 'alphabeticalByName' }
+	size := int_param(q, 'size', 10, 500)
+	offset := int_param(q, 'offset', 0, max_int)
+	return match kind {
+		'starred' {
+			[]Album{}
+		}
+		'highest' {
+			if !rated || !app.has_ratings() {
+				[]Album{}
+			} else {
+				app.albums_mat(rated, 'where rating > 0 order by rating desc, album collate nocase limit ? offset ?', [
+					size.str(),
+					offset.str(),
+				])
+			}
+		}
+		'random' {
+			app.random_albums(rated, size)
+		}
+		'newest' {
+			app.albums_mat(rated, 'order by added_at desc, album collate nocase limit ? offset ?', [
+				size.str(),
+				offset.str(),
+			])
+		}
+		'frequent' {
+			app.albums_mat(rated, 'where play_count > 0 order by play_count desc, album collate nocase limit ? offset ?', [
+				size.str(),
+				offset.str(),
+			])
+		}
+		'recent' {
+			app.albums_mat(rated, 'where last_played > 0 order by last_played desc, album collate nocase limit ? offset ?', [
+				size.str(),
+				offset.str(),
+			])
+		}
+		'alphabeticalByArtist' {
+			app.albums_mat(rated, 'order by album_artist collate nocase, album collate nocase limit ? offset ?', [
+				size.str(),
+				offset.str(),
+			])
+		}
+		'byGenre' {
+			app.albums_mat(rated, 'where genre = ? order by album collate nocase limit ? offset ?', [
+				q.get('genre') or { '' },
+				size.str(),
+				offset.str(),
+			])
+		}
+		'byYear' {
+			app.albums_by_year(rated, q, size, offset)
+		}
+		else {
+			app.albums_mat(rated, 'order by album collate nocase limit ? offset ?', [
+				size.str(),
+				offset.str(),
+			])
+		}
+	}
+}
+
 fn song(it Item) json2.Any {
 	ext := os.file_ext(it.path).to_lower()
+	id_str := it.id.str()
+	al_id := album_id(it.album_artist, it.album)
 	mut s := map[string]json2.Any{}
-	s['id'] = it.id.str()
-	s['parent'] = album_id(it.album_artist, it.album)
+	s['id'] = id_str
+	s['parent'] = al_id
 	s['isDir'] = false
 	s['title'] = it.title
 	s['album'] = or_unknown(it.album, 'Album')
 	s['artist'] = or_unknown(it.artist, 'Artist')
-	s['albumId'] = album_id(it.album_artist, it.album)
+	s['albumId'] = al_id
 	s['artistId'] = artist_id(it.artist)
 	s['track'] = it.track_no
 	s['year'] = it.year
 	s['genre'] = it.genre
-	s['coverArt'] = it.id.str()
+	s['coverArt'] = id_str
 	s['size'] = it.size
 	s['contentType'] = media_types[ext]
 	s['suffix'] = ext.trim_left('.')
@@ -126,6 +478,12 @@ fn song(it Item) json2.Any {
 	s['type'] = 'music'
 	s['isVideo'] = false
 	s['created'] = iso(it.added_at)
+	if it.play_count > 0 {
+		s['playCount'] = it.play_count
+	}
+	if it.last_played > 0 {
+		s['played'] = iso(it.last_played)
+	}
 	return s
 }
 
@@ -133,47 +491,82 @@ fn songs(items []Item) json2.Any {
 	return json2.Any(items.map(song(it)))
 }
 
-fn (app &App) albums(rated bool, tail string, params []string) []json2.Any {
-	mut out := []json2.Any{}
-	for al in app.album_rows(tail, params) {
-		mut a := map[string]json2.Any{}
-		a['id'] = album_id(al.artist, al.name)
-		a['parent'] = artist_id(al.artist)
-		a['isDir'] = true
-		a['name'] = or_unknown(al.name, 'Album')
-		a['title'] = or_unknown(al.name, 'Album')
-		a['album'] = or_unknown(al.name, 'Album')
-		a['artist'] = or_unknown(al.artist, 'Artist')
-		a['artistId'] = artist_id(al.artist)
-		a['songCount'] = al.songs
-		a['duration'] = al.duration
-		a['year'] = al.year
-		a['genre'] = al.genre
-		a['coverArt'] = al.first_id.str()
-		a['created'] = iso(al.added_at)
-		if rated && al.rating > 0 {
-			a['userRating'] = al.rating
-		}
-		out << a
+fn sub_album(rated bool, al Album) json2.Any {
+	al_id := album_id(al.artist, al.name)
+	ar_id := artist_id(al.artist)
+	al_name := or_unknown(al.name, 'Album')
+	ar_name := or_unknown(al.artist, 'Artist')
+	mut a := map[string]json2.Any{}
+	a['id'] = al_id
+	a['parent'] = ar_id
+	a['isDir'] = true
+	a['name'] = al_name
+	a['title'] = al_name
+	a['album'] = al_name
+	a['artist'] = ar_name
+	a['artistId'] = ar_id
+	a['songCount'] = al.songs
+	a['duration'] = al.duration
+	a['year'] = al.year
+	a['genre'] = al.genre
+	a['coverArt'] = al.first_id.str()
+	a['created'] = iso(al.added_at)
+	if rated && al.rating > 0 {
+		a['userRating'] = al.rating
 	}
-	return out
+	if al.play_count > 0 {
+		a['playCount'] = al.play_count
+	}
+	if al.last_played > 0 {
+		a['played'] = iso(al.last_played)
+	}
+	return a
+}
+
+fn albums_json(rated bool, list []Album) []json2.Any {
+	return list.map(sub_album(rated, it))
+}
+
+fn (app &App) albums_by_year(rated bool, q urllib.Values, size int, offset int) []Album {
+	has_from := (q.get('fromYear') or { '' }) != ''
+	has_to := (q.get('toYear') or { '' }) != ''
+	if has_from || has_to {
+		fy := (q.get('fromYear') or { '0' }).int()
+		ty := (q.get('toYear') or { '9999' }).int()
+		if fy <= ty {
+			return app.albums_mat(rated, 'where year >= ? and year <= ? order by year asc, album collate nocase limit ? offset ?', [
+				fy.str(),
+				ty.str(),
+				size.str(),
+				offset.str(),
+			])
+		}
+		return app.albums_mat(rated, 'where year >= ? and year <= ? order by year desc, album collate nocase limit ? offset ?', [
+			ty.str(),
+			fy.str(),
+			size.str(),
+			offset.str(),
+		])
+	}
+	return app.albums_mat(rated, 'order by year, album collate nocase limit ? offset ?', [
+		size.str(),
+		offset.str(),
+	])
 }
 
 fn (app &App) artist_index() []json2.Any {
-	rows := app.reader().exec('select artist, count(distinct album), min(id) from items where ${audio} group by artist order by artist collate nocase') or {
-		return []
-	}
+	rows := app.artists_mat('artist', 'order by name collate nocase', [])
 	mut letters := []string{}
 	mut groups := map[string][]json2.Any{}
 	for r in rows {
-		name := or_unknown(r.vals[0], 'Artist')
+		name := or_unknown(r.name, 'Artist')
 		first := name[..1].to_upper()
 		letter := if first[0].is_letter() { first } else { '#' }
 		mut a := map[string]json2.Any{}
-		a['id'] = artist_id(r.vals[0])
+		a['id'] = artist_id(r.name)
 		a['name'] = name
-		a['albumCount'] = r.vals[1].int()
-		a['coverArt'] = r.vals[2]
+		a['albumCount'] = r.albums
+		a['coverArt'] = r.first_id.str()
 		if letter !in groups {
 			letters << letter
 		}
@@ -219,6 +612,19 @@ fn sub_playlist(pl Playlist, items []Item, with_entries bool) json2.Any {
 	if with_entries {
 		o['entry'] = songs(items)
 	}
+	return o
+}
+
+fn sub_playlist_summary(ps PlaylistSummary) json2.Any {
+	mut o := map[string]json2.Any{}
+	o['id'] = ps.id.str()
+	o['name'] = ps.name
+	o['owner'] = ps.owner
+	o['public'] = true
+	o['songCount'] = ps.songs
+	o['duration'] = ps.duration
+	o['created'] = iso(ps.created_at)
+	o['changed'] = iso(ps.created_at)
 	return o
 }
 
@@ -281,15 +687,14 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 	q := urllib.parse_query(raw) or { urllib.new_values() }
 
 	user := q.get('u') or { '' }
-	apps := sql app.db {
-		select from ClientApp where name == user && enabled == true
-	} or { []ClientApp{} }
-	if apps.len == 0 || !sub_secret_ok(apps[0].subsonic_password, q.get('p') or { '' }, q.get('t') or {
-		''
-	}, q.get('s') or { '' }) {
+	client := app.cached_app_by_name(user) or {
 		return sub_error(mut ctx, q, 40, 'Wrong username or password.')
 	}
-	p := app.principal_for(apps[0])
+	if !sub_secret_ok(client.subsonic_password, q.get('p') or { '' }, q.get('t') or { '' },
+		q.get('s') or { '' }) {
+		return sub_error(mut ctx, q, 40, 'Wrong username or password.')
+	}
+	p := app.principal_for(client)
 
 	need := match method {
 		'ping', 'getLicense', 'getUser', 'getOpenSubsonicExtensions' { '' }
@@ -311,22 +716,31 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 
 	id := q.get('id') or { '' }
 	rated := p.can('ratings:read')
+	is_json := (q.get('f') or { 'xml' }) == 'json'
 	mut out := Obj(map[string]json2.Any{})
 	match method {
-		'ping' {}
+		'ping' {
+			if is_json {
+				return ctx.send_response_to_client('application/json',
+					'{"subsonic-response":{"status":"ok","version":"1.16.1","type":"vlyra","serverVersion":"${version}","openSubsonic":true}}')
+			}
+		}
 		'getLicense' {
 			mut l := map[string]json2.Any{}
 			l['valid'] = true
 			out['license'] = l
 		}
 		'getOpenSubsonicExtensions' {
+			mut f := map[string]json2.Any{}
+			f['name'] = 'formPost'
+			f['versions'] = [json2.Any(1)]
 			mut e := map[string]json2.Any{}
 			e['name'] = 'songLyrics'
 			e['versions'] = [json2.Any(1)]
 			mut t := map[string]json2.Any{}
 			t['name'] = 'vlyraTags'
 			t['versions'] = [json2.Any(1)]
-			out['openSubsonicExtensions'] = [json2.Any(e), t]
+			out['openSubsonicExtensions'] = [json2.Any(f), e, t]
 		}
 		'getUser' {
 			mut u := map[string]json2.Any{}
@@ -351,10 +765,15 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		'getScanStatus' {
 			mut s := map[string]json2.Any{}
 			s['scanning'] = app.scanning
-			s['count'] = app.db.q_int('select count(*) from items where ${audio}') or { 0 }
+			s['count'] = app.reader().q_int('select count(*) from items where ${audio}') or { 0 }
 			out['scanStatus'] = s
 		}
 		'getArtists', 'getIndexes' {
+			if is_json {
+				rows := app.artists_mat('artist', 'order by name collate nocase', [])
+				return ctx.send_response_to_client('application/json', encode_sub_artists_json(&rows,
+					method == 'getArtists'))
+			}
 			mut a := map[string]json2.Any{}
 			a['ignoredArticles'] = ''
 			a['index'] = app.artist_index()
@@ -368,9 +787,9 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		'getArtist', 'getMusicDirectory' {
 			parts := decode_id(id)
 			if id.starts_with('ar-') {
-				found := app.albums(rated,
-					'and artist = ? group by ${album_group} order by max(year), album collate nocase',
-					parts)
+				found := albums_json(rated, app.albums_mat(rated,
+					"where album_artist = ?1 or exists (select 1 from items i where i.missing = 0 and i.kind = 'audio' and i.artist = ?1 and i.album_artist = albums.album_artist and i.album = albums.album) order by year, album collate nocase",
+					parts))
 				mut a := map[string]json2.Any{}
 				a['id'] = id
 				a['name'] = or_unknown(parts[0], 'Artist')
@@ -401,48 +820,34 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		}
 		'getAlbum' {
 			parts := decode_id(id)
-			found := if parts.len == 2 {
-				app.albums(rated, 'and ${album_match} group by ${album_group}', parts)
+			rows := if parts.len == 2 {
+				app.albums_mat(rated, 'where ${album_match} limit 1', parts)
 			} else {
-				[]json2.Any{}
+				[]Album{}
 			}
-			if found.len == 0 {
+			if rows.len == 0 {
 				return sub_error(mut ctx, q, 70, 'Album not found.')
 			}
-			mut a := found[0].as_map()
-			a['song'] = songs(app.items('where ${audio} and ${album_match} order by track_no, title',
-				parts))
+			tracks := app.items('where ${audio} and ${album_match} order by track_no, title',
+				parts)
+			if is_json {
+				al := unsafe { &rows[0] }
+				return ctx.send_response_to_client('application/json', encode_sub_album_detail_json(al,
+					&tracks, rated))
+			}
+			mut a := sub_album(rated, rows[0]).as_map()
+			a['song'] = songs(tracks)
 			out['album'] = a
 		}
 		'getAlbumList', 'getAlbumList2' {
-			kind := q.get('type') or { 'alphabeticalByName' }
-			mut filter := ''
-			mut params := []string{}
-			if kind == 'byGenre' {
-				filter = 'and genre = ?'
-				params << q.get('genre') or { '' }
-			}
-			order := match kind {
-				'random' { 'random()' }
-				'newest', 'recent', 'frequent' { 'max(added_at) desc' }
-				'alphabeticalByArtist' { 'album_artist collate nocase, album collate nocase' }
-				'byYear' { 'max(year), album collate nocase' }
-				'highest' { 'rating desc, album collate nocase' }
-				else { 'album collate nocase' }
+			list := app.sub_album_list(rated, q)
+			if is_json {
+				return ctx.send_response_to_client('application/json', encode_sub_album_list_json(&list,
+					rated, method == 'getAlbumList'))
 			}
 
-			having := if kind == 'highest' { 'having rating > 0' } else { '' }
-
-			params << int_param(q, 'size', 10, 500).str()
-			params << int_param(q, 'offset', 0, max_int).str()
 			mut l := map[string]json2.Any{}
-			l['album'] = if kind == 'starred' || (kind == 'highest' && !rated) {
-				[]json2.Any{}
-			} else {
-				app.albums(rated,
-					'${filter} group by ${album_group} ${having} order by ${order} limit ? offset ?',
-					params)
-			}
+			l['album'] = albums_json(rated, list)
 
 			out[if method == 'getAlbumList' {
 				'albumList'
@@ -451,15 +856,16 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			}] = l
 		}
 		'getGenres' {
-			rows := app.db.exec("select genre, count(*), count(distinct album_artist || char(31) || album) from items where ${audio} and genre != '' group by genre order by genre collate nocase") or {
-				[]
+			rows := app.genres_mat()
+			if is_json {
+				return ctx.send_response_to_client('application/json', encode_sub_genres_json(&rows))
 			}
 			mut list := []json2.Any{}
-			for r in rows {
+			for gr in rows {
 				mut g := map[string]json2.Any{}
-				g['value'] = r.vals[0]
-				g['songCount'] = r.vals[1].int()
-				g['albumCount'] = r.vals[2].int()
+				g['value'] = gr.name
+				g['songCount'] = gr.songs
+				g['albumCount'] = gr.albums
 				list << g
 			}
 			mut g := map[string]json2.Any{}
@@ -471,8 +877,12 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			out['song'] = song(it)
 		}
 		'getRandomSongs' {
+			items := app.random_items(int_param(q, 'size', 10, 500))
+			if is_json {
+				return ctx.send_response_to_client('application/json', encode_sub_random_songs_json(&items))
+			}
 			mut r := map[string]json2.Any{}
-			r['song'] = songs(app.random_items(int_param(q, 'size', 10, 500)))
+			r['song'] = songs(items)
 			out['randomSongs'] = r
 		}
 		'getStarred', 'getStarred2' {
@@ -483,32 +893,65 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			}] = map[string]json2.Any{}
 		}
 		'search2', 'search3' {
-			pattern := '%' + (q.get('query') or { '' }).trim('"') + '%'
+			q_text := (q.get('query') or { '' }).trim('"').trim_space()
+			song_cnt := int_param(q, 'songCount', 20, 500)
+			song_off := int_param(q, 'songOffset', 0, max_int)
+			album_cnt := int_param(q, 'albumCount', 20, 500)
+			album_off := int_param(q, 'albumOffset', 0, max_int)
+			artist_cnt := int_param(q, 'artistCount', 20, 500)
+			artist_off := int_param(q, 'artistOffset', 0, max_int)
+			song_rows := if song_cnt > 0 {
+				if q_text == '' {
+					app.items('where ${audio} order by artist collate nocase, album collate nocase, track_no limit ? offset ?', [
+						song_cnt.str(),
+						song_off.str(),
+					])
+				} else {
+					app.search_items_fts(q_text, 'title artist album', true, '', song_cnt,
+						song_off)
+				}
+			} else {
+				[]Item{}
+			}
+			album_rows := if album_cnt > 0 {
+				if q_text == '' {
+					app.albums_mat(rated, 'order by album collate nocase limit ? offset ?', [
+						album_cnt.str(),
+						album_off.str(),
+					])
+				} else {
+					app.search_albums_fts(rated, q_text, '', album_cnt, album_off)
+				}
+			} else {
+				[]Album{}
+			}
+			artist_rows := if artist_cnt > 0 {
+				if q_text == '' {
+					app.artists_mat('artist', 'order by name collate nocase limit ? offset ?', [
+						artist_cnt.str(),
+						artist_off.str(),
+					])
+				} else {
+					app.search_artists_fts('artist', q_text, artist_cnt, artist_off)
+				}
+			} else {
+				[]ArtistRow{}
+			}
+			if is_json {
+				return ctx.send_response_to_client('application/json', encode_sub_search_json(&song_rows,
+					&album_rows, &artist_rows, rated, method == 'search2'))
+			}
 			mut r := map[string]json2.Any{}
-			r['song'] = songs(app.items('where ${audio} and (title like ?1 or artist like ?1 or album like ?1) order by artist collate nocase, album collate nocase, track_no limit ?2 offset ?3', [
-				pattern,
-				int_param(q, 'songCount', 20, 500).str(),
-				int_param(q, 'songOffset', 0, max_int).str(),
-			]))
-			r['album'] = app.albums(rated,
-				'and (album like ?1 or album_artist like ?1) group by ${album_group} order by album collate nocase limit ?2 offset ?3', [
-				pattern,
-				int_param(q, 'albumCount', 20, 500).str(),
-				int_param(q, 'albumOffset', 0, max_int).str(),
-			])
-			artist_rows := app.reader().exec_param_many('select artist, count(distinct album), min(id) from items where ${audio} and artist like ?1 group by artist order by artist collate nocase limit ?2 offset ?3', [
-				pattern,
-				int_param(q, 'artistCount', 20, 500).str(),
-				int_param(q, 'artistOffset', 0, max_int).str(),
-			]) or { [] }
+			r['song'] = songs(song_rows)
+			r['album'] = albums_json(rated, album_rows)
 			mut artists := []json2.Any{}
 			for row in artist_rows {
-				mut a := map[string]json2.Any{}
-				a['id'] = artist_id(row.vals[0])
-				a['name'] = or_unknown(row.vals[0], 'Artist')
-				a['albumCount'] = row.vals[1].int()
-				a['coverArt'] = row.vals[2]
-				artists << a
+				mut a_obj := map[string]json2.Any{}
+				a_obj['id'] = artist_id(row.name)
+				a_obj['name'] = or_unknown(row.name, 'Artist')
+				a_obj['albumCount'] = row.albums
+				a_obj['coverArt'] = row.first_id.str()
+				artists << a_obj
 			}
 			r['artist'] = artists
 
@@ -550,11 +993,12 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			out['lyricsList'] = l
 		}
 		'getPlaylists' {
-			found := sql app.db {
-				select from Playlist order by name
-			} or { []Playlist{} }
+			sums := app.playlist_summaries()
+			if is_json {
+				return ctx.send_response_to_client('application/json', encode_sub_playlists_json(&sums))
+			}
 			mut l := map[string]json2.Any{}
-			l['playlist'] = found.map(sub_playlist(it, app.playlist_items(it.id), false))
+			l['playlist'] = sums.map(sub_playlist_summary(it))
 			out['playlists'] = l
 		}
 		'getPlaylist' {

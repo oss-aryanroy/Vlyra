@@ -182,12 +182,6 @@ fn (mut app App) scan() {
 		known[r.vals[0]] = r.vals[1] == '1'
 		mtimes[r.vals[0]] = r.vals[2].i64()
 	}
-	mut edited := map[string][]string{}
-	for r in app.db.exec("select i.path, c.field from contributions c join items i on i.id = c.entity_id where c.entity = 'item'") or {
-		return
-	} {
-		edited[r.vals[0]] << r.vals[1]
-	}
 	reread_all := app.get('tags_version') != tag_reader_version
 	now := time.now().unix()
 	mut seen := map[string]bool{}
@@ -205,7 +199,15 @@ fn (mut app App) scan() {
 			work << path
 		}
 	}
+	mut changed := false
 	if work.len > 0 {
+		changed = true
+		mut edited := map[string][]string{}
+		for r in app.reader().exec("select i.path, c.field from contributions c join items i on i.id = c.entity_id where c.entity = 'item'") or {
+			return
+		} {
+			edited[r.vals[0]] << r.vals[1]
+		}
 		mut workers := runtime.nr_cpus()
 		if workers < 2 {
 			workers = 2
@@ -218,6 +220,10 @@ fn (mut app App) scan() {
 			spawn probe_worker(app.ffprobe, paths_ch, items_ch)
 		}
 		spawn push_all(paths_ch, work)
+		unsafe {
+			mut c := app.cache
+			c.tx_mu.lock()
+		}
 		app.db.exec('begin') or { eprintln('scan: ${err}') }
 		for i, _ in work {
 			it := <-items_ch
@@ -257,12 +263,20 @@ fn (mut app App) scan() {
 			}
 		}
 		app.db.exec('commit') or { eprintln('scan: ${err}') }
+		unsafe {
+			mut c := app.cache
+			c.tx_mu.unlock()
+		}
 	}
 	if reread_all {
 		app.set('tags_version', tag_reader_version)
 	}
 	// Rows scanned before file_added existed carry their scan time; fix them once.
 	if app.get('added_from_files') == '' {
+		unsafe {
+			mut c := app.cache
+			c.tx_mu.lock()
+		}
 		app.db.exec('begin') or {}
 		for path, _ in seen {
 			if path in known {
@@ -273,16 +287,46 @@ fn (mut app App) scan() {
 			}
 		}
 		app.db.exec('commit') or { eprintln('scan: ${err}') }
+		unsafe {
+			mut c := app.cache
+			c.tx_mu.unlock()
+		}
 		app.set('added_from_files', '1')
+		changed = true
 	}
+	mut unmiss := []string{}
 	for path, _ in seen {
 		if path in known && known[path] {
-			app.db.exec_param('update items set missing = 0 where path = ?', path) or {}
+			unmiss << path
 		}
 	}
+	mut miss := []string{}
 	for path, was_missing in known {
 		if !was_missing && path !in seen {
+			miss << path
+		}
+	}
+	if unmiss.len > 0 || miss.len > 0 {
+		changed = true
+		unsafe {
+			mut c := app.cache
+			c.tx_mu.lock()
+		}
+		app.db.exec('begin immediate') or {}
+		for path in unmiss {
+			app.db.exec_param('update items set missing = 0 where path = ?', path) or {}
+		}
+		for path in miss {
 			app.db.exec_param('update items set missing = 1 where path = ?', path) or {}
 		}
+		app.db.exec('commit') or {}
+		unsafe {
+			mut c := app.cache
+			c.tx_mu.unlock()
+		}
+	}
+	if changed {
+		app.rebuild_catalog()
+		app.db.exec('pragma optimize') or {}
 	}
 }

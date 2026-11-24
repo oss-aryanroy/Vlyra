@@ -47,12 +47,15 @@ fn jf_names(artist string) []json2.Any {
 	return [json2.Any(o)]
 }
 
-fn jf_userdata(key string) json2.Any {
+fn jf_userdata(key string, plays int, last_played i64) json2.Any {
 	mut u := map[string]json2.Any{}
 	u['PlaybackPositionTicks'] = 0
-	u['PlayCount'] = 0
+	u['PlayCount'] = plays
 	u['IsFavorite'] = false
-	u['Played'] = false
+	u['Played'] = plays > 0
+	if last_played > 0 {
+		u['LastPlayedDate'] = iso(last_played)
+	}
 	u['Key'] = key
 	return u
 }
@@ -64,12 +67,19 @@ fn jf_image(first_id int) json2.Any {
 }
 
 fn (app &App) jf_server_id() string {
-	return md5.hexhash('vlyra\x1f${app.data_dir}')
+	return app.server_id
 }
 
 fn (app &App) jf_song(it Item) json2.Any {
 	ext := os.file_ext(it.path).to_lower().trim_left('.')
 	id := jf_item_id(it.id)
+	id_str := it.id.str()
+	srv := app.server_id
+	al_id := jf_album_id(it.album_artist, it.album)
+	aa := if it.album_artist != '' { it.album_artist } else { it.artist }
+	ar_name := or_unknown(it.artist, 'Artist')
+	ar_items := jf_names(it.artist)
+	aa_items := if aa == it.artist { ar_items } else { jf_names(aa) }
 	mut stream := map[string]json2.Any{}
 	stream['Type'] = 'Audio'
 	stream['Codec'] = ext
@@ -90,7 +100,7 @@ fn (app &App) jf_song(it Item) json2.Any {
 	src['MediaStreams'] = [json2.Any(stream)]
 	mut s := map[string]json2.Any{}
 	s['Name'] = it.title
-	s['ServerId'] = app.jf_server_id()
+	s['ServerId'] = srv
 	s['Id'] = id
 	s['Type'] = 'Audio'
 	s['MediaType'] = 'Audio'
@@ -101,41 +111,43 @@ fn (app &App) jf_song(it Item) json2.Any {
 	s['IndexNumber'] = it.track_no
 	s['ProductionYear'] = it.year
 	s['Album'] = or_unknown(it.album, 'Album')
-	s['AlbumId'] = jf_album_id(it.album_artist, it.album)
-	s['ParentId'] = jf_album_id(it.album_artist, it.album)
-	s['AlbumArtist'] = or_unknown(it.artist, 'Artist')
-	s['AlbumArtists'] = jf_names(it.artist)
-	s['Artists'] = [json2.Any(or_unknown(it.artist, 'Artist'))]
-	s['ArtistItems'] = jf_names(it.artist)
+	s['AlbumId'] = al_id
+	s['ParentId'] = al_id
+	s['AlbumArtist'] = or_unknown(aa, 'Artist')
+	s['AlbumArtists'] = aa_items
+	s['Artists'] = [json2.Any(ar_name)]
+	s['ArtistItems'] = ar_items
 	s['Genres'] = if it.genre != '' { [json2.Any(it.genre)] } else { []json2.Any{} }
 	s['DateCreated'] = iso(it.added_at)
 	s['ImageTags'] = jf_image(it.id)
-	s['AlbumPrimaryImageTag'] = it.id.str()
-	s['UserData'] = jf_userdata(id)
+	s['AlbumPrimaryImageTag'] = id_str
+	s['UserData'] = jf_userdata(id, it.play_count, it.last_played)
 	s['MediaSources'] = [json2.Any(src)]
 	return s
 }
 
 fn (app &App) jf_album(al Album) json2.Any {
 	id := jf_album_id(al.artist, al.name)
+	ar_name := or_unknown(al.artist, 'Artist')
+	ar_items := jf_names(al.artist)
 	mut a := map[string]json2.Any{}
 	a['Name'] = or_unknown(al.name, 'Album')
-	a['ServerId'] = app.jf_server_id()
+	a['ServerId'] = app.server_id
 	a['Id'] = id
 	a['Type'] = 'MusicAlbum'
 	a['IsFolder'] = true
 	a['ParentId'] = jf_view
-	a['AlbumArtist'] = or_unknown(al.artist, 'Artist')
-	a['AlbumArtists'] = jf_names(al.artist)
-	a['Artists'] = [json2.Any(or_unknown(al.artist, 'Artist'))]
-	a['ArtistItems'] = jf_names(al.artist)
+	a['AlbumArtist'] = ar_name
+	a['AlbumArtists'] = ar_items
+	a['Artists'] = [json2.Any(ar_name)]
+	a['ArtistItems'] = ar_items
 	a['ProductionYear'] = al.year
 	a['ChildCount'] = al.songs
 	a['RunTimeTicks'] = i64(al.duration) * jf_ticks
 	a['Genres'] = if al.genre != '' { [json2.Any(al.genre)] } else { []json2.Any{} }
 	a['DateCreated'] = iso(al.added_at)
 	a['ImageTags'] = jf_image(al.first_id)
-	a['UserData'] = jf_userdata(id)
+	a['UserData'] = jf_userdata(id, al.play_count, al.last_played)
 	return a
 }
 
@@ -149,33 +161,28 @@ fn (app &App) jf_artist(ar ArtistRow) json2.Any {
 	a['IsFolder'] = true
 	a['AlbumCount'] = ar.albums
 	a['ImageTags'] = jf_image(ar.first_id)
-	a['UserData'] = jf_userdata(id)
+	a['UserData'] = jf_userdata(id, 0, 0)
 	return a
 }
 
-fn (app &App) jf_playlist(pl Playlist) json2.Any {
-	items := app.playlist_items(pl.id)
-	mut total := 0
-	for it in items {
-		total += it.duration
-	}
-	id := jf_playlist_id(pl.id)
+fn (app &App) jf_playlist_summary(ps PlaylistSummary) json2.Any {
+	id := jf_playlist_id(ps.id)
 	mut o := map[string]json2.Any{}
-	o['Name'] = pl.name
-	o['ServerId'] = app.jf_server_id()
+	o['Name'] = ps.name
+	o['ServerId'] = app.server_id
 	o['Id'] = id
 	o['Type'] = 'Playlist'
 	o['MediaType'] = 'Audio'
 	o['IsFolder'] = true
-	o['ChildCount'] = items.len
-	o['RunTimeTicks'] = i64(total) * jf_ticks
-	o['DateCreated'] = iso(pl.created_at)
-	o['ImageTags'] = if items.len > 0 {
-		jf_image(items[0].id)
+	o['ChildCount'] = ps.songs
+	o['RunTimeTicks'] = i64(ps.duration) * jf_ticks
+	o['DateCreated'] = iso(ps.created_at)
+	o['ImageTags'] = if ps.first_id > 0 {
+		jf_image(ps.first_id)
 	} else {
 		json2.Any(map[string]json2.Any{})
 	}
-	o['UserData'] = jf_userdata(id)
+	o['UserData'] = jf_userdata(id, 0, 0)
 	return o
 }
 
@@ -188,7 +195,7 @@ fn (app &App) jf_view() json2.Any {
 	v['CollectionType'] = 'music'
 	v['IsFolder'] = true
 	v['ImageTags'] = map[string]json2.Any{}
-	v['UserData'] = jf_userdata(jf_view)
+	v['UserData'] = jf_userdata(jf_view, 0, 0)
 	return v
 }
 
@@ -232,28 +239,24 @@ fn jf_page(items []json2.Any, total int, start int) json2.Any {
 	return o
 }
 
-fn jf_slice(all []json2.Any, start int, limit int) json2.Any {
-	from := if start < all.len { start } else { all.len }
-	to := if from + limit < all.len { from + limit } else { all.len }
-	return jf_page(all[from..to], all.len, start)
+fn jf_bounds(total int, start int, limit int) (int, int) {
+	from := if start < 0 {
+		0
+	} else if start < total {
+		start
+	} else {
+		total
+	}
+	to := if limit <= 0 || from + limit > total { total } else { from + limit }
+	return from, to
 }
 
 fn (app &App) jf_find_album(id string) ?Album {
-	for al in app.album_rows('group by ${album_group}', []) {
-		if jf_album_id(al.artist, al.name) == id {
-			return al
-		}
-	}
-	return none
+	return app.find_album_by_jf_id(id)
 }
 
 fn (app &App) jf_find_artist(id string) ?ArtistRow {
-	for ar in app.artist_rows('group by artist', []) {
-		if jf_artist_id(ar.name) == id {
-			return ar
-		}
-	}
-	return none
+	return app.find_artist_by_jf_id(id)
 }
 
 fn (app &App) jf_lookup(id string) ?json2.Any {
@@ -263,8 +266,8 @@ fn (app &App) jf_lookup(id string) ?json2.Any {
 	if n := app.item(jf_row(id, `1`)) {
 		return app.jf_song(n)
 	}
-	if pl := app.playlist(jf_row(id, `2`)) {
-		return app.jf_playlist(pl)
+	if ps := app.playlist_summary(jf_row(id, `2`)) {
+		return app.jf_playlist_summary(ps)
 	}
 	if al := app.jf_find_album(id) {
 		return app.jf_album(al)
@@ -308,7 +311,7 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 	limit := if q['limit'].int() > 0 { q['limit'].int() } else { 1000000 }
 	sort_by := q['sortby'].to_lower()
 	dir := if q['sortorder'].to_lower().starts_with('desc') { 'desc' } else { 'asc' }
-	pattern := '%' + q['searchterm'] + '%'
+	search_q := q['searchterm'].trim_space()
 	nothing := jf_page([], 0, start)
 
 	if q['filters'].to_lower().contains('isfavorite') || q['isfavorite'] == 'true' {
@@ -325,13 +328,19 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 		if !p.can('playlists:read') {
 			return nothing
 		}
-		return jf_slice(app.playlist_items(jf_row(parent, `2`)).map(app.jf_song(it)), start, limit)
+		raw := app.playlist_items(jf_row(parent, `2`))
+		from, to := jf_bounds(raw.len, start, limit)
+		return jf_page(raw[from..to].map(app.jf_song(it)), raw.len, start)
 	}
 
 	song_order := if sort_by.contains('random') {
 		'random()'
 	} else if sort_by.contains('datecreated') {
 		'added_at ${dir}'
+	} else if sort_by.contains('playcount') {
+		'play_count ${dir}, title collate nocase'
+	} else if sort_by.contains('dateplayed') {
+		'last_played ${dir}, title collate nocase'
 	} else if sort_by.starts_with('sortname') || sort_by.starts_with('name') {
 		'title collate nocase ${dir}'
 	} else {
@@ -340,9 +349,17 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 	album_order := if sort_by.contains('random') {
 		'random()'
 	} else if sort_by.contains('datecreated') {
-		'max(added_at) ${dir}'
+		'added_at ${dir}'
 	} else if sort_by.contains('productionyear') || sort_by.contains('premieredate') {
-		'max(year) ${dir}, album collate nocase'
+		'year ${dir}, album collate nocase'
+	} else if sort_by.contains('playcount') {
+		'play_count ${dir}, album collate nocase'
+	} else if sort_by.contains('dateplayed') {
+		'last_played ${dir}, album collate nocase'
+	} else if sort_by.contains('albumartist') {
+		'album_artist collate nocase ${dir}, album collate nocase'
+	} else if sort_by.contains('communityrating') {
+		'rating ${dir}, album collate nocase'
 	} else {
 		'album collate nocase ${dir}'
 	}
@@ -359,11 +376,15 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 	if artist_ref !in ['', jf_view] {
 		if ar := app.jf_find_artist(artist_ref) {
 			if types.contains('audio') {
-				return app.jf_songs('and artist = ?', [ar.name], song_order, start, limit)
+				return app.jf_songs('and (artist = ?1 or album_artist = ?1)', [ar.name],
+					song_order, start, limit)
 			}
-			return jf_slice(app.album_rows('and artist = ? group by ${album_group} order by ${album_order}', [
+			raw := app.albums_mat(false,
+				"where album_artist = ?1 or exists (select 1 from items i where i.missing = 0 and i.kind = 'audio' and i.artist = ?1 and i.album_artist = albums.album_artist and i.album = albums.album) order by ${album_order}", [
 				ar.name,
-			]).map(app.jf_album(it)), start, limit)
+			])
+			from, to := jf_bounds(raw.len, start, limit)
+			return jf_page(raw[from..to].map(app.jf_album(it)), raw.len, start)
 		}
 	}
 
@@ -377,27 +398,54 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 		if !p.can('playlists:read') {
 			return nothing
 		}
-		found := sql app.db {
-			select from Playlist order by name
-		} or { []Playlist{} }
-		return jf_slice(found.map(app.jf_playlist(it)), start, limit)
+		raw := app.playlist_summaries()
+		from, to := jf_bounds(raw.len, start, limit)
+		return jf_page(raw[from..to].map(app.jf_playlist_summary(it)), raw.len, start)
 	}
 	if types.contains('musicartist') {
-		return jf_slice(app.artist_rows('and artist like ? group by artist order by artist collate nocase', [
-			pattern,
-		]).map(app.jf_artist(it)), start, limit)
+		kind := if q['_albumartists'] == '1' { 'album_artist' } else { 'artist' }
+		total := if search_q == '' {
+			app.artists_mat_count(kind, '', [])
+		} else {
+			app.search_artists_fts_count(kind, search_q)
+		}
+		rows := if search_q == '' {
+			app.artists_mat(kind, 'order by name collate nocase limit ? offset ?', [
+				limit.str(),
+				start.str(),
+			])
+		} else {
+			app.search_artists_fts(kind, search_q, limit, start)
+		}
+		return jf_page(rows.map(app.jf_artist(it)), total, start)
 	}
-	if types.contains('musicalbum') || (types == '' && parent == jf_view && q['searchterm'] == '') {
-		mut params := [pattern, pattern]
-		params << genre_param
-		return jf_slice(app.album_rows('and (album like ? or album_artist like ?) ${genre_filter} group by ${album_group} order by ${album_order}',
-			params).map(app.jf_album(it)), start, limit)
+	if types.contains('musicalbum') || (types == '' && parent == jf_view && search_q == '') {
+		if sort_by.contains('random') && search_q == '' && genre == '' {
+			total := app.albums_mat_count('', [])
+			found := app.random_albums(false, limit)
+			return jf_page(found.map(app.jf_album(it)), total, start)
+		}
+		if search_q == '' {
+			where_genre := if genre != '' { 'where genre = ?' } else { '' }
+			total := app.albums_mat_count(where_genre, genre_param)
+			mut params := genre_param.clone()
+			params << [limit.str(), start.str()]
+			found := app.albums_mat(false, '${where_genre} order by ${album_order} limit ? offset ?',
+				params)
+			return jf_page(found.map(app.jf_album(it)), total, start)
+		}
+		total := app.search_albums_fts_count(search_q, genre)
+		found := app.search_albums_fts(false, search_q, genre, limit, start)
+		return jf_page(found.map(app.jf_album(it)), total, start)
 	}
-	if types.contains('audio') || q['searchterm'] != '' {
-		mut params := [pattern, pattern, pattern]
-		params << genre_param
-		return app.jf_songs('and (title like ? or artist like ? or album like ?) ${genre_filter}',
-			params, song_order, start, limit)
+	if types.contains('audio') || search_q != '' {
+		if search_q == '' {
+			return app.jf_songs(genre_filter, genre_param, song_order, start, limit)
+		}
+		total := app.search_items_fts_count(search_q, 'title artist album', true, genre)
+		found := app.search_items_fts(search_q, 'title artist album', true, genre, limit,
+			start)
+		return jf_page(found.map(app.jf_song(it)), total, start)
 	}
 	if types == '' && parent == '' {
 		return jf_page([app.jf_view()], 1, 0)
@@ -540,10 +588,15 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 		if post {
 			app.record_play(p, jf_row(id, `1`), 0) or { return ctx.not_found() }
 		}
-		return jf_send(mut ctx, jf_userdata(id))
+		it := app.item(jf_row(id, `1`))
+		return jf_send(mut ctx, if x := it {
+			jf_userdata(id, x.play_count, x.last_played)
+		} else {
+			jf_userdata(id, 0, 0)
+		})
 	}
 	if a in ['favoriteitems', 'userfavoriteitems'] {
-		return jf_send(mut ctx, jf_userdata(id))
+		return jf_send(mut ctx, jf_userdata(id, 0, 0))
 	}
 	if a == 'displaypreferences' {
 		mut o := map[string]json2.Any{}
@@ -560,14 +613,11 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 		return jf_send(mut ctx, jf_page([app.jf_view()], 1, 0))
 	}
 	if a in ['genres', 'musicgenres'] {
-		rows := app.db.exec("select distinct genre from items where ${audio} and genre != '' order by genre collate nocase") or {
-			[]
-		}
 		mut list := []json2.Any{}
-		for r in rows {
+		for gr in app.genres_mat() {
 			mut g := map[string]json2.Any{}
-			g['Name'] = r.vals[0]
-			g['Id'] = md5.hexhash('ge\x1f' + r.vals[0])
+			g['Name'] = gr.name
+			g['Id'] = md5.hexhash('ge\x1f' + gr.name)
 			g['Type'] = 'MusicGenre'
 			list << g
 		}
@@ -576,6 +626,9 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 	if a == 'artists' && (id == '' || id == 'albumartists') {
 		mut qq := q.clone()
 		qq['includeitemtypes'] = 'MusicArtist'
+		if id == 'albumartists' {
+			qq['_albumartists'] = '1'
+		}
 		return jf_send(mut ctx, app.jf_items(p, qq))
 	}
 	if a in ['audio', 'videos'] || (a == 'items' && tail in ['download', 'file']) {
@@ -624,35 +677,34 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 			return jf_send(mut ctx, o)
 		}
 		pid := jf_row(id, `2`)
-		pl := app.playlist(pid) or { return ctx.not_found() }
-		current := app.playlist_items(pid)
-		if tail == 'items' && post {
-			mut ids := current.map(it.id)
-			ids << ids_param(q['ids'])
-			app.save_playlist(p, pid, '', ids) or { return ctx.not_found() }
-			return ctx.no_content()
-		}
-		if tail == 'items' && ctx.req.method == .delete {
-			gone := q['entryids'].split(',').map(jf_norm(it))
-			app.save_playlist(p, pid, '', current.filter(jf_item_id(it.id) !in gone).map(it.id)) or {
-				return ctx.not_found()
-			}
-			return ctx.no_content()
-		}
+		ps := app.playlist_summary(pid) or { return ctx.not_found() }
 		if tail == 'items' {
-			mut entries := []json2.Any{}
-			for it in current {
+			current := app.playlist_items(pid)
+			if post {
+				mut ids := current.map(it.id)
+				ids << ids_param(q['ids'])
+				app.save_playlist(p, pid, '', ids) or { return ctx.not_found() }
+				return ctx.no_content()
+			}
+			if ctx.req.method == .delete {
+				gone := q['entryids'].split(',').map(jf_norm(it))
+				app.save_playlist(p, pid, '', current.filter(jf_item_id(it.id) !in gone).map(it.id)) or {
+					return ctx.not_found()
+				}
+				return ctx.no_content()
+			}
+			pstart := if q['startindex'].int() > 0 { q['startindex'].int() } else { 0 }
+			plimit := if q['limit'].int() > 0 { q['limit'].int() } else { 1000000 }
+			from, to := jf_bounds(current.len, pstart, plimit)
+			mut entries := []json2.Any{cap: to - from}
+			for it in current[from..to] {
 				mut e := app.jf_song(it).as_map()
 				e['PlaylistItemId'] = jf_item_id(it.id)
 				entries << e
 			}
-			return jf_send(mut ctx, jf_slice(entries, q['startindex'].int(), if q['limit'].int() > 0 {
-				q['limit'].int()
-			} else {
-				1000000
-			}))
+			return jf_send(mut ctx, jf_page(entries, current.len, pstart))
 		}
-		return jf_send(mut ctx, app.jf_playlist(pl))
+		return jf_send(mut ctx, app.jf_playlist_summary(ps))
 	}
 	if a == 'items' {
 		if id == '' {
@@ -660,7 +712,7 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 		}
 		if id == 'latest' {
 			limit := if q['limit'].int() > 0 { q['limit'].int() } else { 20 }
-			return jf_send(mut ctx, app.album_rows('group by ${album_group} order by max(added_at) desc limit ?', [
+			return jf_send(mut ctx, app.albums_mat(false, 'order by added_at desc limit ?', [
 				limit.str(),
 			]).map(app.jf_album(it)))
 		}

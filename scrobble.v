@@ -198,5 +198,6 @@ pub fn (mut app App) disconnect_scrobbler(mut ctx Context, name string) veb.Resu
 	app.db.exec_param('delete from settings where key like ?', '${name}.%') or {
 		return fail(mut ctx, .internal_server_error, err.msg())
 	}
+	app.reload_settings()
 	return ok(mut ctx)
 }

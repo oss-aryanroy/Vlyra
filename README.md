@@ -154,23 +154,23 @@ back on the same day.
 
 | | Vlyra | Navidrome |
 | --- | --- | --- |
-| Binary | 3.7 MB | 66 MB |
-| Start and first scan | 1.1 s | 11.2 s |
-| Memory, idle after scan | 32 MB | 64 MB |
-| Memory after the load test | 128 MB | 113 MB |
+| Binary | 3.8 MB | 66 MB |
+| Start and first scan | 1.0 s | 9.6 s |
+| Memory, idle after scan | 52 MB | 63 MB |
+| Memory after the load test | 143 MB | 105 MB |
 
-Subsonic requests, 3,000 each at 20 concurrent, no errors on either:
+Subsonic requests, 3,000 each at 20 concurrent (HTTP/1.1 keep-alive), no errors on either:
 
 | Request | Vlyra req/s (p99) | Navidrome req/s (p99) |
 | --- | --- | --- |
-| ping | 22,562 (3 ms) | 3,727 (21 ms) |
-| stream a 16 KB file | 19,850 (3 ms) | 2,283 (31 ms) |
-| getArtists | 1,586 (40 ms) | 547 (60 ms) |
-| album list, newest 50 | 1,850 (35 ms) | 1,533 (26 ms) |
-| album list, random 50 | 1,540 (42 ms) | 706 (48 ms) |
-| getAlbum | 4,141 (15 ms) | 1,630 (22 ms) |
-| search "harbour" | 876 (71 ms) | 275 (129 ms) |
-| 50 random songs | 849 (74 ms) | 475 (73 ms) |
+| ping | 30,404 (2 ms) | 6,208 (18 ms) |
+| stream a 16 KB file | 26,694 (2 ms) | 3,195 (19 ms) |
+| getArtists | 9,792 (6 ms) | 906 (41 ms) |
+| album list, newest 50 | 8,442 (7 ms) | 2,267 (17 ms) |
+| album list, random 50 | 12,053 (4 ms) | 921 (38 ms) |
+| getAlbum | 21,877 (3 ms) | 2,268 (15 ms) |
+| search "harbour" | 9,061 (6 ms) | 303 (120 ms) |
+| 50 random songs | 6,054 (10 ms) | 590 (57 ms) |
 
 Navidrome returns more fields per item, so its responses are larger. The test
 files are 2-second generated tones, over loopback, so streaming figures say

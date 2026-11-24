@@ -276,46 +276,43 @@ pub fn (mut app App) list_items(mut ctx Context) veb.Result {
 			ctx.query['artist'],
 			ctx.query['album'],
 		])
-		return ctx.json(ItemPage{
-			items:  found
-			total:  found.len
-			rating: if p.can('ratings:read') {
-				app.album_rating(ctx.query['artist'], ctx.query['album'])
-			} else {
-				0
-			}
-		})
+		rating := if p.can('ratings:read') {
+			app.album_rating(ctx.query['artist'], ctx.query['album'])
+		} else {
+			0
+		}
+		return ctx.send_response_to_client('application/json', encode_item_page_json(&found,
+			found.len, rating))
 	}
 	offset := if ctx.query['offset'].int() > 0 { ctx.query['offset'].int() } else { 0 }
-	pattern := '%' + ctx.query['q'].trim_space() + '%'
-	where := 'where missing = 0 and (title like ?1 or artist like ?1 or album like ?1 or genre like ?1 or tags like ?1)'
-	total := app.db.exec_param('select count(*) from items ${where}', pattern) or {
-		return fail(mut ctx, .internal_server_error, err.msg())
-	}
-	return ctx.json(ItemPage{
-		items: app.items('${where} order by artist collate nocase, album collate nocase, track_no, title collate nocase limit ?2 offset ?3', [
-			pattern,
+	q_str := ctx.query['q'].trim_space()
+	if q_str == '' {
+		total := app.reader().q_int('select count(*) from items where missing = 0') or { 0 }
+		found := app.items('where missing = 0 order by artist collate nocase, album collate nocase, track_no, title collate nocase limit ? offset ?', [
 			limit.str(),
 			offset.str(),
 		])
-		total: total[0].vals[0].int()
-	})
+		return ctx.send_response_to_client('application/json', encode_item_page_json(&found,
+			total, 0))
+	}
+	found := app.search_items_fts(q_str, '', false, '', limit, offset)
+	total := app.search_items_fts_count(q_str, '', false, '')
+	return ctx.send_response_to_client('application/json', encode_item_page_json(&found,
+		total, 0))
 }
 
 @['/api/v1/albums']
 pub fn (mut app App) list_albums(mut ctx Context) veb.Result {
 	p := app.auth(ctx, 'library:read') or { return deny(mut ctx, err) }
-	pattern := '%' + ctx.query['q'].trim_space() + '%'
-	found := app.album_rows('and (album like ?1 or album_artist like ?1) group by ${album_group} order by album_artist collate nocase, max(year), album collate nocase', [
-		pattern,
-	])
-	if p.can('ratings:read') {
-		return ctx.json(found)
+	q_str := ctx.query['q'].trim_space()
+	rated := p.can('ratings:read')
+	found := if q_str == '' {
+		app.albums_mat(rated, 'order by album_artist collate nocase, year, album collate nocase',
+			[])
+	} else {
+		app.search_albums_fts(rated, q_str, '', 100000, 0)
 	}
-	return ctx.json(found.map(Album{
-		...it
-		rating: 0
-	}))
+	return ctx.send_response_to_client('application/json', encode_albums_json(&found))
 }
 
 @['/api/v1/albums/rating'; put]
@@ -435,10 +432,15 @@ fn int_list(v json2.Any) []int {
 @['/api/v1/playlists']
 pub fn (mut app App) list_playlists(mut ctx Context) veb.Result {
 	app.auth(ctx, 'playlists:read') or { return deny(mut ctx, err) }
-	found := sql app.db {
-		select from Playlist order by name
-	} or { []Playlist{} }
-	return ctx.json(found)
+	rows := app.reader().exec('select id, name, owner, created_at from playlists order by name') or {
+		return ctx.json([]Playlist{})
+	}
+	return ctx.json(rows.map(Playlist{
+		id:         it.vals[0].int()
+		name:       it.vals[1]
+		owner:      it.vals[2]
+		created_at: it.vals[3].i64()
+	}))
 }
 
 @['/api/v1/playlists'; post]
@@ -489,7 +491,7 @@ struct PlayView {
 @['/api/v1/plays']
 pub fn (mut app App) list_plays(mut ctx Context) veb.Result {
 	app.auth(ctx, 'history:read') or { return deny(mut ctx, err) }
-	rows := app.db.exec('select p.id, p.item_id, i.title, i.artist, p.app_name, p.at from plays p join items i on i.id = p.item_id order by p.id desc limit 200') or {
+	rows := app.reader().exec('select p.id, p.item_id, i.title, i.artist, p.app_name, p.at from plays p join items i on i.id = p.item_id order by p.id desc limit 200') or {
 		return fail(mut ctx, .internal_server_error, err.msg())
 	}
 	return ctx.json(rows.map(PlayView{
@@ -528,13 +530,18 @@ fn clean_scopes(v json2.Any) !string {
 @['/api/v1/apps']
 pub fn (mut app App) list_apps(mut ctx Context) veb.Result {
 	app.auth(ctx, 'admin') or { return deny(mut ctx, err) }
-	found := sql app.db {
-		select from ClientApp order by name
-	} or { []ClientApp{} }
-	return ctx.json(found.map(ClientApp{
-		...it
+	rows := app.reader().exec('select id, name, subsonic_password, scopes, enabled, created_at, last_seen from apps order by name') or {
+		return ctx.json([]ClientApp{})
+	}
+	return ctx.json(rows.map(ClientApp{
+		id:                it.vals[0].int()
+		name:              it.vals[1]
 		token_hash:        ''
-		subsonic_password: if it.subsonic_password != '' { 'set' } else { '' }
+		subsonic_password: if it.vals[2] != '' { 'set' } else { '' }
+		scopes:            it.vals[3]
+		enabled:           it.vals[4] == '1'
+		created_at:        it.vals[5].i64()
+		last_seen:         app.live_last_seen(it.vals[0].int(), it.vals[6].i64())
 	}))
 }
 
@@ -572,6 +579,7 @@ pub fn (mut app App) create_app(mut ctx Context) veb.Result {
 		scopes,
 		time.now().unix().str(),
 	]) or { return fail(mut ctx, .conflict, 'an app named "${name}" already exists') }
+	app.reload_apps()
 	return ctx.json(NewApp{
 		...secret
 		id: rows[0].vals[0].int()
@@ -592,6 +600,7 @@ pub fn (mut app App) update_app(mut ctx Context, id int) veb.Result {
 			id.str(),
 		]) or {}
 	}
+	app.reload_apps()
 	return ok(mut ctx)
 }
 
@@ -599,6 +608,7 @@ pub fn (mut app App) update_app(mut ctx Context, id int) veb.Result {
 pub fn (mut app App) delete_app(mut ctx Context, id int) veb.Result {
 	app.auth(ctx, 'admin') or { return deny(mut ctx, err) }
 	app.db.exec_param('delete from apps where id = ?', id.str()) or {}
+	app.reload_apps()
 	return ok(mut ctx)
 }
 
@@ -607,20 +617,30 @@ pub fn (mut app App) activity(mut ctx Context) veb.Result {
 	app.auth(ctx, 'admin') or { return deny(mut ctx, err) }
 	item_id := ctx.query['item_id'].int()
 	app_id := ctx.query['app_id'].int()
-	found := if item_id > 0 {
-		sql app.db {
-			select from Contribution where entity == 'item' && entity_id == item_id order by id desc limit 200
-		} or { []Contribution{} }
+	const_cols := 'id, app_id, app_name, entity, entity_id, label, field, old_value, new_value, at'
+	rows := if item_id > 0 {
+		app.reader().exec_param("select ${const_cols} from contributions where entity = 'item' and entity_id = ? order by id desc limit 200",
+			item_id.str()) or { [] }
 	} else if 'app_id' in ctx.query {
-		sql app.db {
-			select from Contribution where app_id == app_id order by id desc limit 200
-		} or { []Contribution{} }
+		app.reader().exec_param('select ${const_cols} from contributions where app_id = ? order by id desc limit 200',
+			app_id.str()) or { [] }
 	} else {
-		sql app.db {
-			select from Contribution order by id desc limit 200
-		} or { []Contribution{} }
+		app.reader().exec('select ${const_cols} from contributions order by id desc limit 200') or {
+			[]
+		}
 	}
-	return ctx.json(found)
+	return ctx.json(rows.map(Contribution{
+		id:        it.vals[0].int()
+		app_id:    it.vals[1].int()
+		app_name:  it.vals[2]
+		entity:    it.vals[3]
+		entity_id: it.vals[4].int()
+		label:     it.vals[5]
+		field:     it.vals[6]
+		old_value: it.vals[7]
+		new_value: it.vals[8]
+		at:        it.vals[9].i64()
+	}))
 }
 
 struct ProtocolInfo {
@@ -648,7 +668,7 @@ pub fn (mut app App) get_settings(mut ctx Context) veb.Result {
 	return ctx.json(Settings{
 		media_dir:    app.get('media_dir')
 		scanning:     app.scanning
-		items:        app.db.q_int('select count(*) from items where missing = 0') or { 0 }
+		items:        app.reader().q_int('select count(*) from items where missing = 0') or { 0 }
 		ffprobe:      app.ffprobe != ''
 		version:      version
 		listenbrainz: app.get('listenbrainz.user')
