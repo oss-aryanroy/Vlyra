@@ -11,6 +11,7 @@ import veb
 import x.json2
 
 const max_artwork = 10 * 1024 * 1024
+const stream_chunk_threshold = i64(256 * 1024)
 
 fn fail(mut ctx Context, status http.Status, msg string) veb.Result {
 	ctx.res.set_status(status)
@@ -47,8 +48,13 @@ fn serve_media(mut ctx Context, path string) veb.Result {
 	range := ctx.get_header(.range) or { '' }
 	size := i64(os.file_size(path))
 	if !range.starts_with('bytes=') || size == 0 {
-		ctx.set_content_type(mime)
-		return ctx.file(path)
+		if size <= stream_chunk_threshold {
+			ctx.set_content_type(mime)
+			return ctx.file(path)
+		}
+		ctx.takeover_conn()
+		spawn stream_range(mut ctx.conn, path, mime, 0, size - 1, size, false)
+		return veb.no_result()
 	}
 	spec := range[6..].all_before(',').split('-')
 	mut start := spec[0].i64()
@@ -64,14 +70,14 @@ fn serve_media(mut ctx Context, path string) veb.Result {
 	if end > size - 1 {
 		end = size - 1
 	}
-	// veb can only send whole files, so a range is streamed from disk on its own
-	// thread; holding it in memory made memory grow with every listener.
+	// veb can only send whole files buffered in memory, so ranges and large files
+	// are streamed from disk in 64 KB chunks on their own thread.
 	ctx.takeover_conn()
-	spawn stream_range(mut ctx.conn, path, mime, start, end, size)
+	spawn stream_range(mut ctx.conn, path, mime, start, end, size, true)
 	return veb.no_result()
 }
 
-fn stream_range(mut conn net.TcpConn, path string, mime string, start i64, end i64, size i64) {
+fn stream_range(mut conn net.TcpConn, path string, mime string, start i64, end i64, size i64, partial bool) {
 	defer {
 		conn.close() or {}
 	}
@@ -79,10 +85,13 @@ fn stream_range(mut conn net.TcpConn, path string, mime string, start i64, end i
 	defer {
 		f.close()
 	}
-	conn.write_string('HTTP/1.1 206 Partial Content\r\nContent-Type: ${mime}\r\nContent-Length: ${
-		end - start + 1}\r\nContent-Range: bytes ${start}-${end}/${size}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n') or {
-		return
+	header := if partial {
+		'HTTP/1.1 206 Partial Content\r\nContent-Type: ${mime}\r\nContent-Length: ${
+			end - start + 1}\r\nContent-Range: bytes ${start}-${end}/${size}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n'
+	} else {
+		'HTTP/1.1 200 OK\r\nContent-Type: ${mime}\r\nContent-Length: ${size}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n'
 	}
+	conn.write_string(header) or { return }
 	mut buf := []u8{len: 64 * 1024}
 	mut pos := start
 	for pos <= end {

@@ -173,5 +173,26 @@ Subsonic requests, 3,000 each at 20 concurrent (HTTP/1.1 keep-alive), no errors 
 | 50 random songs | 6,054 (10 ms) | 590 (57 ms) |
 
 Navidrome returns more fields per item, so its responses are larger. The test
-files are 2-second generated tones, over loopback, so streaming figures say
-nothing about large files.
+files above are 2-second generated tones over loopback, so they only measure
+metadata and small-file overhead.
+
+### Real FLAC streaming
+
+Measured on a 6-vCPU ARM64 Linux VPS (7.7 GiB RAM, SSD) in Docker (`vlyra` vs.
+`deluan/navidrome:0.64.2`) over loopback against a real library of **177 FLAC
+files** (71 albums, 84 artists, **4.96 GiB** total, avg **28.7 MiB** /
+4.3–105.5 MiB, avg duration 205 s, avg bitrate **1,173 kbps**). Fresh idle
+Vlyra container footprint: **6.4 MiB** RSS. No errors on either server:
+
+| Scenario | Vlyra throughput (p99 TTFB · peak RSS) | Navidrome 0.64.2 (p99 TTFB · peak RSS) |
+| --- | --- | --- |
+| Non-Range `c = 10` (full FLACs) | 637.4 MiB/s (46.9 ms · 7.1 MiB) | 414.5 MiB/s (82.9 ms · 159.1 MiB) |
+| Non-Range `c = 50` (full FLACs) | 472.9 MiB/s (260.8 ms · 27.8 MiB) | — |
+| Range `c = 10` (full FLACs) | 826.9 MiB/s (23.3 ms · 13.0 MiB) | 394.8 MiB/s (92.7 ms · 178.2 MiB) |
+| Range `c = 50` (full FLACs) | 508.7 MiB/s (145.9 ms · 36.9 MiB) | 548.8 MiB/s (199.4 ms · 270.6 MiB) |
+| Range `c = 100` (full FLACs) | 464.6 MiB/s (408.6 ms · 113.3 MiB) | 478.4 MiB/s (933.5 ms · 318.4 MiB) |
+| Live-paced `c = 200` (1,173 kbps × 5 s) | 24.2 MiB/s (327.7 ms · 130.2% CPU) | 20.0 MiB/s (1,802.3 ms · 373.2% CPU) |
+
+At 3.9–6.9 Gbps of sustained direct-stream throughput, outbound network
+bandwidth—not CPU or RAM—is the limiting factor on this VPS (roughly ~830
+concurrent 1,173 kbps FLAC listeners per Gbps of upload).
