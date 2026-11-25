@@ -2,29 +2,47 @@ module main
 
 import db.sqlite
 import rand
+import sync.stdatomic
 import time
+
+fn (app &App) catalog_version() u64 {
+	return stdatomic.load_u64(&app.catalog_gen)
+}
+
+fn (app &App) bump_catalog_gen() {
+	stdatomic.add_u64(&app.catalog_gen, 1)
+}
 
 @[table: 'items']
 pub struct Item {
 pub mut:
-	id           int    @[primary; sql: serial]
-	path         string @[unique]
-	kind         string
-	title        string
-	artist       string
-	album        string
-	genre        string
-	year         int
-	track_no     int
-	duration     int
-	tags         string
-	size         i64
-	added_at     i64
-	missing      bool
-	mtime        i64
-	album_artist string
-	play_count   int
-	last_played  i64
+	id            int    @[primary; sql: serial]
+	path          string @[unique]
+	kind          string
+	title         string
+	artist        string
+	album         string
+	genre         string
+	year          int
+	track_no      int
+	duration      int
+	tags          string
+	size          i64
+	added_at      i64
+	missing       bool
+	mtime         i64
+	album_artist  string
+	play_count    int
+	last_played   i64
+	disc_no       int
+	bitrate       int
+	sample_rate   int
+	bit_depth     int
+	channels      int
+	rg_track_gain f64
+	rg_album_gain f64
+	rg_track_peak f64
+	rg_album_peak f64
 }
 
 @[table: 'apps']
@@ -74,9 +92,10 @@ pub mut:
 	at       i64
 }
 
-const item_fields = ['title', 'artist', 'album_artist', 'album', 'genre', 'year', 'track_no', 'tags']
-const item_cols = 'id, path, kind, title, artist, album, genre, year, track_no, duration, tags, size, added_at, album_artist, play_count, last_played'
-const item_cols_i = 'i.id, i.path, i.kind, i.title, i.artist, i.album, i.genre, i.year, i.track_no, i.duration, i.tags, i.size, i.added_at, i.album_artist, i.play_count, i.last_played'
+const item_fields = ['title', 'artist', 'album_artist', 'album', 'genre', 'year', 'track_no',
+	'disc_no', 'tags']
+const item_cols = 'id, path, kind, title, artist, album, genre, year, track_no, duration, tags, size, added_at, album_artist, play_count, last_played, disc_no, bitrate, sample_rate, bit_depth, channels, rg_track_gain, rg_album_gain, rg_track_peak, rg_album_peak'
+const item_cols_i = 'i.id, i.path, i.kind, i.title, i.artist, i.album, i.genre, i.year, i.track_no, i.duration, i.tags, i.size, i.added_at, i.album_artist, i.play_count, i.last_played, i.disc_no, i.bitrate, i.sample_rate, i.bit_depth, i.channels, i.rg_track_gain, i.rg_album_gain, i.rg_track_peak, i.rg_album_peak'
 
 fn (mut app App) migrate() ! {
 	sql app.db {
@@ -92,23 +111,40 @@ fn (mut app App) migrate() ! {
 		'create table if not exists lyrics (item_id integer primary key, text text not null)',
 		'create table if not exists playlist_items (playlist_id integer not null, pos integer not null, item_id integer not null, primary key (playlist_id, pos))',
 		'create table if not exists album_ratings (album_artist text not null, album text not null, rating integer not null, primary key (album_artist, album))',
+		'create table if not exists stars (kind text not null, key text not null, at integer not null, primary key (kind, key))',
+		'create table if not exists play_queue (id integer primary key check (id = 1), item_ids text not null, current_id integer not null, position_ms integer not null, changed_by text not null, updated_at integer not null)',
 		'create table if not exists albums (id integer primary key, album_artist text not null, album text not null, songs integer not null, duration integer not null, year integer not null, genre text not null, first_id integer not null, added_at integer not null, rating integer not null default 0, play_count integer not null default 0, last_played integer not null default 0, jf_id text not null, unique (album_artist, album))',
 		'create table if not exists artists (id integer primary key, kind text not null, name text not null, albums integer not null, first_id integer not null, jf_id text not null, unique (kind, name))',
 		'create table if not exists genres (name text primary key, songs integer not null, albums integer not null)',
 	] {
 		app.db.exec(q)!
 	}
-	app.db.exec('alter table items add column mtime integer not null default 0') or {}
-	app.db.exec("alter table items add column album_artist text not null default ''") or {}
-	app.db.exec('alter table items add column play_count integer not null default 0') or {}
-	app.db.exec('alter table items add column last_played integer not null default 0') or {}
+	for col_ddl in [
+		'alter table items add column mtime integer not null default 0',
+		"alter table items add column album_artist text not null default ''",
+		'alter table items add column play_count integer not null default 0',
+		'alter table items add column last_played integer not null default 0',
+		'alter table items add column disc_no integer not null default 0',
+		'alter table items add column bitrate integer not null default 0',
+		'alter table items add column sample_rate integer not null default 0',
+		'alter table items add column bit_depth integer not null default 0',
+		'alter table items add column channels integer not null default 0',
+		'alter table items add column rg_track_gain real not null default 0.0',
+		'alter table items add column rg_album_gain real not null default 0.0',
+		'alter table items add column rg_track_peak real not null default 0.0',
+		'alter table items add column rg_album_peak real not null default 0.0',
+	] {
+		app.db.exec(col_ddl) or {}
+	}
 	app.db.exec("update items set album_artist = artist where album_artist = ''")!
 	app.db.exec('update items set play_count = (select count(*) from plays p where p.item_id = items.id), last_played = coalesce((select max(p.at) from plays p where p.item_id = items.id), 0) where play_count = 0 and id in (select distinct item_id from plays)')!
 	// Cover the album and artist aggregates, so grouping reads the index alone.
 	app.db.exec('create index if not exists items_album on items (album_artist, album, missing, kind, duration, year, genre, added_at)')!
 	app.db.exec('create index if not exists items_artist on items (artist, album, missing, kind)')!
 	app.db.exec("create index if not exists items_audio_album_tracks on items (album_artist, album, track_no, title collate nocase) where missing = 0 and kind = 'audio'")!
+	app.db.exec("create index if not exists items_audio_album_disc on items (album_artist, album, disc_no, track_no, title collate nocase) where missing = 0 and kind = 'audio'")!
 	app.db.exec('create index if not exists items_list_order on items (artist collate nocase, album collate nocase, track_no, title collate nocase) where missing = 0')!
+	app.db.exec('create index if not exists items_list_order_disc on items (artist collate nocase, album collate nocase, disc_no, track_no, title collate nocase) where missing = 0')!
 	app.db.exec('create index if not exists contributions_entity on contributions (entity, entity_id, id desc)')!
 	app.db.exec('create index if not exists contributions_app on contributions (app_id, id desc)')!
 	app.db.exec('create index if not exists plays_item on plays (item_id, at desc)')!
@@ -176,7 +212,7 @@ fn (app &App) set(key string, value string) {
 }
 
 fn (app &App) reload_ratings_flag() {
-	has := (app.reader().q_int('select exists(select 1 from album_ratings)') or { 0 }) == 1
+	has := (app.fast_q_int('select exists(select 1 from album_ratings)', []) or { 0 }) == 1
 	unsafe {
 		mut c := app.cache
 		c.mu.lock()
@@ -198,23 +234,32 @@ fn (app &App) has_ratings() bool {
 fn item_from(r sqlite.Row) Item {
 	v := r.vals
 	return Item{
-		id:           v[0].int()
-		path:         v[1]
-		kind:         v[2]
-		title:        v[3]
-		artist:       v[4]
-		album:        v[5]
-		genre:        v[6]
-		year:         v[7].int()
-		track_no:     v[8].int()
-		duration:     v[9].int()
-		tags:         v[10]
-		size:         v[11].i64()
-		added_at:     v[12].i64()
-		missing:      v.len > 16 && v[16] == '1'
-		album_artist: v[13]
-		play_count:   v[14].int()
-		last_played:  v[15].i64()
+		id:            v[0].int()
+		path:          v[1]
+		kind:          v[2]
+		title:         v[3]
+		artist:        v[4]
+		album:         v[5]
+		genre:         v[6]
+		year:          v[7].int()
+		track_no:      v[8].int()
+		duration:      v[9].int()
+		tags:          v[10]
+		size:          v[11].i64()
+		added_at:      v[12].i64()
+		album_artist:  v[13]
+		play_count:    v[14].int()
+		last_played:   v[15].i64()
+		disc_no:       v[16].int()
+		bitrate:       v[17].int()
+		sample_rate:   v[18].int()
+		bit_depth:     v[19].int()
+		channels:      v[20].int()
+		rg_track_gain: v[21].f64()
+		rg_album_gain: v[22].f64()
+		rg_track_peak: v[23].f64()
+		rg_album_peak: v[24].f64()
+		missing:       v.len > 25 && v[25] == '1'
 	}
 }
 
@@ -257,17 +302,13 @@ fn unique_random_ids(top int, want int) []string {
 
 // `tail` must be a code constant; user input only ever goes in `params`.
 fn (app &App) items(tail string, params []string) []Item {
-	rows := app.reader().exec_param_many('select ${item_cols} from items ${tail}', params) or {
-		eprintln('items: ${err}')
-		return []
-	}
-	return rows.map(item_from(it))
+	return app.fast_items('select ${item_cols} from items ${tail}', params, false)
 }
 
 // Ids are drawn here, not with ORDER BY random(): SQLite's random() takes a
 // process-wide lock per row, which stalls parallel requests.
 fn (app &App) random_items(n int) []Item {
-	top := app.reader().q_int('select max(id) from items') or { 0 }
+	top := app.fast_q_int('select max(id) from items', []) or { 0 }
 	if top <= 0 || n <= 0 {
 		return []
 	}
@@ -291,9 +332,9 @@ fn (app &App) random_items(n int) []Item {
 }
 
 fn (app &App) item(id int) ?Item {
-	rows := app.reader().exec_param('select ${item_cols}, missing from items where id = ?',
-		id.str()) or { return none }
-	return if rows.len > 0 { item_from(rows[0]) } else { none }
+	return app.fast_item_one('select ${item_cols}, missing from items where id = ?', [
+		id.str(),
+	], true)
 }
 
 pub struct Album {
@@ -517,28 +558,22 @@ fn (app &App) rebuild_catalog() {
 		return
 	}
 	app.db.exec('commit') or { eprintln('rebuild commit: ${err}') }
+	app.bump_catalog_gen()
 }
 
 // `tail` must be a code constant.
 fn (app &App) albums_mat(with_rating bool, tail string, params []string) []Album {
-	rows := app.reader().exec_param_many('select ${album_mat_cols} from albums ${tail}',
-		params) or {
-		eprintln('albums_mat: ${err}')
-		return []
-	}
-	return rows.map(album_from_mat(it, with_rating))
+	return app.fast_albums(with_rating, 'select ${album_mat_cols} from albums ${tail}',
+		params)
 }
 
 // `tail` must be a code constant.
 fn (app &App) albums_mat_count(tail string, params []string) int {
-	rows := app.reader().exec_param_many('select count(*) from albums ${tail}', params) or {
-		return 0
-	}
-	return if rows.len > 0 { rows[0].vals[0].int() } else { 0 }
+	return app.fast_q_int('select count(*) from albums ${tail}', params) or { 0 }
 }
 
 fn (app &App) random_albums(with_rating bool, n int) []Album {
-	top := app.reader().q_int('select max(id) from albums') or { 0 }
+	top := app.fast_q_int('select max(id) from albums', []) or { 0 }
 	if top <= 0 || n <= 0 {
 		return []
 	}
@@ -561,92 +596,45 @@ fn (app &App) random_albums(with_rating bool, n int) []Album {
 }
 
 fn (app &App) find_album_by_jf_id(jf_id string) ?Album {
-	rows := app.reader().exec_param('select ${album_mat_cols} from albums where jf_id = ? limit 1',
-		jf_id) or { return none }
-	return if rows.len > 0 { album_from_mat(rows[0], false) } else { none }
+	rows := app.fast_albums(false, 'select ${album_mat_cols} from albums where jf_id = ? limit 1',
+		[jf_id])
+	return if rows.len > 0 { rows[0] } else { none }
 }
 
 // `tail` must be a code constant.
 fn (app &App) artists_mat(kind string, tail string, params []string) []ArtistRow {
 	mut all := [kind]
 	all << params
-	rows := app.reader().exec_param_many('select name, albums, first_id from artists where kind = ? ${tail}',
-		all) or {
-		eprintln('artists_mat: ${err}')
-		return []
-	}
-	return rows.map(ArtistRow{
-		name:     it.vals[0]
-		albums:   it.vals[1].int()
-		first_id: it.vals[2].int()
-	})
+	return app.fast_artists('select name, albums, first_id from artists where kind = ? ${tail}',
+		all)
 }
 
 // `tail` must be a code constant.
 fn (app &App) artists_mat_count(kind string, tail string, params []string) int {
 	mut all := [kind]
 	all << params
-	rows := app.reader().exec_param_many('select count(*) from artists where kind = ? ${tail}',
-		all) or { return 0 }
-	return if rows.len > 0 { rows[0].vals[0].int() } else { 0 }
+	return app.fast_q_int('select count(*) from artists where kind = ? ${tail}', all) or { 0 }
 }
 
 fn (app &App) find_artist_by_jf_id(jf_id string) ?ArtistRow {
-	rows := app.reader().exec_param("select name, albums, first_id from artists where jf_id = ? order by case when kind = 'artist' then 0 else 1 end limit 1",
-		jf_id) or { return none }
-	if rows.len == 0 {
-		return none
-	}
-	v := rows[0].vals
-	return ArtistRow{
-		name:     v[0]
-		albums:   v[1].int()
-		first_id: v[2].int()
-	}
+	rows := app.fast_artists("select name, albums, first_id from artists where jf_id = ? order by case when kind = 'artist' then 0 else 1 end limit 1",
+		[jf_id])
+	return if rows.len > 0 { rows[0] } else { none }
 }
 
 fn (app &App) genres_mat() []GenreRow {
-	rows := app.reader().exec('select name, songs, albums from genres order by name collate nocase') or {
-		return []
-	}
-	return rows.map(GenreRow{
-		name:   it.vals[0]
-		songs:  it.vals[1].int()
-		albums: it.vals[2].int()
-	})
+	return app.fast_genres('select name, songs, albums from genres order by name collate nocase')
 }
 
 fn (app &App) playlist_summaries() []PlaylistSummary {
-	rows := app.reader().exec('select p.id, p.name, p.owner, p.created_at, count(i.id), coalesce(sum(i.duration), 0), coalesce((select pi2.item_id from playlist_items pi2 where pi2.playlist_id = p.id order by pi2.pos limit 1), 0) from playlists p left join playlist_items pi on pi.playlist_id = p.id left join items i on i.id = pi.item_id group by p.id order by p.name') or {
-		return []
-	}
-	return rows.map(PlaylistSummary{
-		id:         it.vals[0].int()
-		name:       it.vals[1]
-		owner:      it.vals[2]
-		created_at: it.vals[3].i64()
-		songs:      it.vals[4].int()
-		duration:   it.vals[5].int()
-		first_id:   it.vals[6].int()
-	})
+	return app.fast_playlists('select p.id, p.name, p.owner, p.created_at, count(i.id), coalesce(sum(i.duration), 0), coalesce((select pi2.item_id from playlist_items pi2 where pi2.playlist_id = p.id order by pi2.pos limit 1), 0) from playlists p left join playlist_items pi on pi.playlist_id = p.id left join items i on i.id = pi.item_id group by p.id order by p.name',
+		[])
 }
 
 fn (app &App) playlist_summary(id int) ?PlaylistSummary {
-	rows := app.reader().exec_param('select p.id, p.name, p.owner, p.created_at, count(i.id), coalesce(sum(i.duration), 0), coalesce((select pi2.item_id from playlist_items pi2 where pi2.playlist_id = p.id order by pi2.pos limit 1), 0) from playlists p left join playlist_items pi on pi.playlist_id = p.id left join items i on i.id = pi.item_id where p.id = ? group by p.id',
-		id.str()) or { return none }
-	if rows.len == 0 {
-		return none
-	}
-	v := rows[0].vals
-	return PlaylistSummary{
-		id:         v[0].int()
-		name:       v[1]
-		owner:      v[2]
-		created_at: v[3].i64()
-		songs:      v[4].int()
-		duration:   v[5].int()
-		first_id:   v[6].int()
-	}
+	rows := app.fast_playlists('select p.id, p.name, p.owner, p.created_at, count(i.id), coalesce(sum(i.duration), 0), coalesce((select pi2.item_id from playlist_items pi2 where pi2.playlist_id = p.id order by pi2.pos limit 1), 0) from playlists p left join playlist_items pi on pi.playlist_id = p.id left join items i on i.id = pi.item_id where p.id = ? group by p.id',
+		[id.str()])
+	return if rows.len > 0 { rows[0] } else { none }
 }
 
 fn fts_query(raw string) string {
@@ -688,12 +676,8 @@ fn (app &App) search_items_fts(raw string, cols string, audio_only bool, genre s
 			params << genre
 		}
 		params << [limit.str(), offset.str()]
-		rows := app.reader().exec_param_many('select ${item_cols_i} from items_fts f join items i on i.id = f.rowid where items_fts match ? and ${base}${genre_cond} limit ? offset ?',
-			params) or {
-			eprintln('search_items_fts: ${err}')
-			return []
-		}
-		return rows.map(item_from(it))
+		return app.fast_items('select ${item_cols_i} from items_fts f join items i on i.id = f.rowid where items_fts match ? and ${base}${genre_cond} limit ? offset ?',
+			params, false)
 	}
 	pattern := '%' + raw + '%'
 	base_plain := if audio_only { audio } else { 'missing = 0' }
@@ -703,14 +687,14 @@ fn (app &App) search_items_fts(raw string, cols string, audio_only bool, genre s
 		'(title like ?1 or artist like ?1 or album like ?1 or genre like ?1 or tags like ?1)'
 	}
 	if genre != '' {
-		return app.items('where ${base_plain} and ${like_cond} and genre = ?2 order by artist collate nocase, album collate nocase, track_no, title collate nocase limit ?3 offset ?4', [
+		return app.items('where ${base_plain} and ${like_cond} and genre = ?2 order by artist collate nocase, album collate nocase, disc_no, track_no, title collate nocase limit ?3 offset ?4', [
 			pattern,
 			genre,
 			limit.str(),
 			offset.str(),
 		])
 	}
-	return app.items('where ${base_plain} and ${like_cond} order by artist collate nocase, album collate nocase, track_no, title collate nocase limit ?2 offset ?3', [
+	return app.items('where ${base_plain} and ${like_cond} order by artist collate nocase, album collate nocase, disc_no, track_no, title collate nocase limit ?2 offset ?3', [
 		pattern,
 		limit.str(),
 		offset.str(),
@@ -726,9 +710,8 @@ fn (app &App) search_items_fts_count(raw string, cols string, audio_only bool, g
 		if genre != '' {
 			params << genre
 		}
-		rows := app.reader().exec_param_many('select count(*) from items_fts f join items i on i.id = f.rowid where items_fts match ? and ${base}${genre_cond}',
-			params) or { return 0 }
-		return if rows.len > 0 { rows[0].vals[0].int() } else { 0 }
+		return app.fast_q_int('select count(*) from items_fts f join items i on i.id = f.rowid where items_fts match ? and ${base}${genre_cond}',
+			params) or { 0 }
 	}
 	pattern := '%' + raw + '%'
 	base_plain := if audio_only { audio } else { 'missing = 0' }
@@ -744,9 +727,8 @@ fn (app &App) search_items_fts_count(raw string, cols string, audio_only bool, g
 	} else {
 		''
 	}
-	rows := app.reader().exec_param_many('select count(*) from items where ${base_plain} and ${like_cond}${g_clause}',
-		params) or { return 0 }
-	return if rows.len > 0 { rows[0].vals[0].int() } else { 0 }
+	return app.fast_q_int('select count(*) from items where ${base_plain} and ${like_cond}${g_clause}',
+		params) or { 0 }
 }
 
 fn (app &App) search_albums_fts(with_rating bool, raw string, genre string, limit int, offset int) []Album {
@@ -758,12 +740,8 @@ fn (app &App) search_albums_fts(with_rating bool, raw string, genre string, limi
 			params << genre
 		}
 		params << [limit.str(), offset.str()]
-		rows := app.reader().exec_param_many('select ${album_mat_cols_a} from albums_fts f join albums a on a.id = f.rowid where albums_fts match ?${genre_cond} limit ? offset ?',
-			params) or {
-			eprintln('search_albums_fts: ${err}')
-			return []
-		}
-		return rows.map(album_from_mat(it, with_rating))
+		return app.fast_albums(with_rating, 'select ${album_mat_cols_a} from albums_fts f join albums a on a.id = f.rowid where albums_fts match ?${genre_cond} limit ? offset ?',
+			params)
 	}
 	pattern := '%' + raw + '%'
 	mut params := [pattern, pattern]
@@ -786,9 +764,8 @@ fn (app &App) search_albums_fts_count(raw string, genre string) int {
 		if genre != '' {
 			params << genre
 		}
-		rows := app.reader().exec_param_many('select count(*) from albums_fts f join albums a on a.id = f.rowid where albums_fts match ?${genre_cond}',
-			params) or { return 0 }
-		return if rows.len > 0 { rows[0].vals[0].int() } else { 0 }
+		return app.fast_q_int('select count(*) from albums_fts f join albums a on a.id = f.rowid where albums_fts match ?${genre_cond}',
+			params) or { 0 }
 	}
 	pattern := '%' + raw + '%'
 	mut params := [pattern, pattern]
@@ -805,20 +782,12 @@ fn (app &App) search_albums_fts_count(raw string, genre string) int {
 fn (app &App) search_artists_fts(kind string, raw string, limit int, offset int) []ArtistRow {
 	fq := fts_query(raw)
 	if fq != '' {
-		rows := app.reader().exec_param_many('select a.name, a.albums, a.first_id from artists_fts f join artists a on a.id = f.rowid where artists_fts match ? and a.kind = ? limit ? offset ?', [
+		return app.fast_artists('select a.name, a.albums, a.first_id from artists_fts f join artists a on a.id = f.rowid where artists_fts match ? and a.kind = ? limit ? offset ?', [
 			fq,
 			kind,
 			limit.str(),
 			offset.str(),
-		]) or {
-			eprintln('search_artists_fts: ${err}')
-			return []
-		}
-		return rows.map(ArtistRow{
-			name:     it.vals[0]
-			albums:   it.vals[1].int()
-			first_id: it.vals[2].int()
-		})
+		])
 	}
 	return app.artists_mat(kind, 'and name like ? order by name collate nocase limit ? offset ?', [
 		'%' + raw + '%',
@@ -830,11 +799,10 @@ fn (app &App) search_artists_fts(kind string, raw string, limit int, offset int)
 fn (app &App) search_artists_fts_count(kind string, raw string) int {
 	fq := fts_query(raw)
 	if fq != '' {
-		rows := app.reader().exec_param_many('select count(*) from artists_fts f join artists a on a.id = f.rowid where artists_fts match ? and a.kind = ?', [
+		return app.fast_q_int('select count(*) from artists_fts f join artists a on a.id = f.rowid where artists_fts match ? and a.kind = ?', [
 			fq,
 			kind,
-		]) or { return 0 }
-		return if rows.len > 0 { rows[0].vals[0].int() } else { 0 }
+		]) or { 0 }
 	}
 	return app.artists_mat_count(kind, 'and name like ?', ['%' + raw + '%'])
 }
@@ -910,7 +878,11 @@ fn (mut app App) set_item_field(p Principal, id int, field string, value string)
 	it := app.item(id) or { return error('no such item') }
 	// `field` is allowlisted above, so it is safe as a column name.
 	old := app.db.exec_param('select ${field} from items where id = ?', id.str())![0].vals[0]
-	new := if field in ['year', 'track_no'] { value.int().str() } else { value.trim_space() }
+	new := if field in ['year', 'track_no', 'disc_no'] {
+		value.int().str()
+	} else {
+		value.trim_space()
+	}
 	if old == new {
 		return
 	}
@@ -918,14 +890,13 @@ fn (mut app App) set_item_field(p Principal, id int, field string, value string)
 	app.log(p, 'item', id, it.title, field, old, new)
 	if field in ['artist', 'album_artist', 'album', 'genre', 'year'] {
 		app.rebuild_catalog()
+	} else {
+		app.bump_catalog_gen()
 	}
 }
 
 fn (app &App) lyrics(id int) string {
-	rows := app.reader().exec_param('select text from lyrics where item_id = ?', id.str()) or {
-		return ''
-	}
-	return if rows.len > 0 { rows[0].vals[0] } else { '' }
+	return app.fast_q_str('select text from lyrics where item_id = ?', [id.str()]) or { '' }
 }
 
 fn (mut app App) set_lyrics(p Principal, id int, text string) ! {
@@ -960,6 +931,7 @@ fn (mut app App) record_play(p Principal, id int, at i64) ! {
 		it.album_artist,
 		it.album,
 	]) or {}
+	app.bump_catalog_gen()
 	spawn app.forward_play(it, play.at)
 }
 
@@ -967,11 +939,10 @@ fn (app &App) album_rating(artist string, album string) int {
 	if !app.has_ratings() {
 		return 0
 	}
-	rows := app.reader().exec_param_many('select rating from album_ratings where ${album_match}', [
+	return app.fast_q_int('select rating from album_ratings where ${album_match}', [
 		artist,
 		album,
-	]) or { return 0 }
-	return if rows.len > 0 { rows[0].vals[0].int() } else { 0 }
+	]) or { 0 }
 }
 
 fn (mut app App) rate_album(p Principal, artist string, album string, rating int) ! {
@@ -1010,6 +981,7 @@ fn (mut app App) rate_album(p Principal, artist string, album string, rating int
 		album,
 	]) or {}
 	app.log(p, 'album', 0, or_unknown(album, 'Album'), 'rating', old.str(), rating.str())
+	app.bump_catalog_gen()
 }
 
 fn (app &App) playlist(id int) ?Playlist {
@@ -1070,6 +1042,7 @@ fn (mut app App) save_playlist(p Principal, id int, name string, item_ids []int)
 			item_id.str(),
 		])!
 	}
+	app.bump_catalog_gen()
 	return pid
 }
 
@@ -1078,6 +1051,7 @@ fn (mut app App) delete_playlist(p Principal, id int) ! {
 	app.db.exec_param('delete from playlist_items where playlist_id = ?', id.str())!
 	app.db.exec_param('delete from playlists where id = ?', id.str())!
 	app.log(p, 'playlist', id, old.name, 'deleted', old.name, '')
+	app.bump_catalog_gen()
 }
 
 struct JsonBuf {
@@ -1161,6 +1135,19 @@ fn (mut j JsonBuf) jint(v i64) {
 	j.grow(n)
 	unsafe { vmemcpy(j.data + j.len, &buf[pos], n) }
 	j.len += n
+}
+
+fn (mut j JsonBuf) jf64(v f64) {
+	if v == 0 {
+		j.byte(`0`)
+		return
+	}
+	s := v.str()
+	if s.len > 2 && s[s.len - 2] == `.` && s[s.len - 1] == `0` {
+		j.raw(s[..s.len - 2])
+		return
+	}
+	j.raw(s)
 }
 
 fn (mut j JsonBuf) jstr(s string) {
@@ -1278,6 +1265,24 @@ fn encode_item_page_json(items &[]Item, total int, rating int) string {
 		j.jint(it.play_count)
 		j.raw(',"last_played":')
 		j.jint(it.last_played)
+		j.raw(',"disc_no":')
+		j.jint(it.disc_no)
+		j.raw(',"bitrate":')
+		j.jint(it.bitrate)
+		j.raw(',"sample_rate":')
+		j.jint(it.sample_rate)
+		j.raw(',"bit_depth":')
+		j.jint(it.bit_depth)
+		j.raw(',"channels":')
+		j.jint(it.channels)
+		j.raw(',"rg_track_gain":')
+		j.jf64(it.rg_track_gain)
+		j.raw(',"rg_album_gain":')
+		j.jf64(it.rg_album_gain)
+		j.raw(',"rg_track_peak":')
+		j.jf64(it.rg_track_peak)
+		j.raw(',"rg_album_peak":')
+		j.jf64(it.rg_album_peak)
 		j.byte(`}`)
 	}
 	j.raw('],"total":')
@@ -1322,4 +1327,112 @@ fn encode_albums_json(albums &[]Album) string {
 	}
 	j.byte(`]`)
 	return j.finish()
+}
+
+struct PlayQueue {
+	item_ids    []int
+	current_id  int
+	position_ms i64
+	changed_by  string
+	updated_at  i64
+}
+
+fn (mut app App) set_star(p Principal, kind string, key string, starred bool) ! {
+	if kind !in ['item', 'album', 'artist'] || key == '' {
+		return error('invalid star target')
+	}
+	was := app.is_starred(kind, key)
+	if was == starred {
+		return
+	}
+	if starred {
+		app.db.exec_param_many('insert or ignore into stars (kind, key, at) values (?, ?, ?)', [
+			kind,
+			key,
+			time.now().unix().str(),
+		])!
+	} else {
+		app.db.exec_param_many('delete from stars where kind = ? and key = ?', [kind, key])!
+	}
+	app.log(p, kind, if kind == 'item' { key.int() } else { 0 }, key, 'star', if was {
+		'1'
+	} else {
+		''
+	}, if starred { '1' } else { '' })
+	app.bump_catalog_gen()
+}
+
+fn (app &App) is_starred(kind string, key string) bool {
+	return (app.fast_q_int('select exists(select 1 from stars where kind = ? and key = ?)', [
+		kind,
+		key,
+	]) or { 0 }) == 1
+}
+
+fn (app &App) starred_map(kind string) map[string]i64 {
+	mut m := map[string]i64{}
+	rows := app.reader().exec_param('select key, at from stars where kind = ?', kind) or {
+		return m
+	}
+	for r in rows {
+		m[r.vals[0]] = r.vals[1].i64()
+	}
+	return m
+}
+
+fn (app &App) starred_items() []Item {
+	return app.items("where ${audio} and exists (select 1 from stars s where s.kind = 'item' and s.key = cast(items.id as text)) order by coalesce((select s.at from stars s where s.kind = 'item' and s.key = cast(items.id as text)), 0) desc, items.id",
+		[])
+}
+
+fn (app &App) starred_albums(with_rating bool, limit int, offset int) []Album {
+	return app.albums_mat(with_rating, "where exists (select 1 from stars s where s.kind = 'album' and s.key = (albums.album_artist || char(31) || albums.album)) order by coalesce((select s.at from stars s where s.kind = 'album' and s.key = (albums.album_artist || char(31) || albums.album)), 0) desc, albums.album collate nocase limit ? offset ?", [
+		limit.str(),
+		offset.str(),
+	])
+}
+
+fn (app &App) starred_artists() []ArtistRow {
+	return app.artists_mat('artist', "and exists (select 1 from stars s where s.kind = 'artist' and s.key = artists.name) order by coalesce((select s.at from stars s where s.kind = 'artist' and s.key = artists.name), 0) desc, artists.name collate nocase",
+		[])
+}
+
+fn (mut app App) save_play_queue(p Principal, item_ids []int, current_id int, position_ms i64, changed_by string) ! {
+	if item_ids.len == 0 {
+		app.db.exec('delete from play_queue where id = 1')!
+		return
+	}
+	ids_csv := item_ids.map(it.str()).join(',')
+	by := if changed_by != '' { changed_by } else { p.name }
+	app.db.exec_param_many('insert into play_queue (id, item_ids, current_id, position_ms, changed_by, updated_at) values (1, ?, ?, ?, ?, ?) on conflict(id) do update set item_ids = excluded.item_ids, current_id = excluded.current_id, position_ms = excluded.position_ms, changed_by = excluded.changed_by, updated_at = excluded.updated_at', [
+		ids_csv,
+		current_id.str(),
+		position_ms.str(),
+		by,
+		time.now().unix().str(),
+	])!
+}
+
+fn (app &App) get_play_queue() ?PlayQueue {
+	rows := app.reader().exec('select item_ids, current_id, position_ms, changed_by, updated_at from play_queue where id = 1') or {
+		return none
+	}
+	if rows.len == 0 {
+		return none
+	}
+	v := rows[0].vals
+	if v[0] == '' {
+		return none
+	}
+	ids := v[0].split(',').filter(it != '').map(it.int()).filter(it > 0)
+	if ids.len == 0 {
+		return none
+	}
+	return PlayQueue{
+		item_ids:    ids
+		current_id:  v[1].int()
+		position_ms: v[2].i64()
+		changed_by:  v[3]
+		updated_at:  v[4].i64()
+	}
 }

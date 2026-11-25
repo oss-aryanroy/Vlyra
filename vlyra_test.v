@@ -1,5 +1,6 @@
 module main
 
+import compress.gzip
 import os
 import crypto.md5
 import crypto.sha256
@@ -817,4 +818,881 @@ fn test_jsonbuf_parity() {
 	assert idx_arr.as_array().len == 2
 	assert (idx_arr.as_array()[0].as_map()['name'] or { json2.Any('') }).str() == 'B'
 	assert (idx_arr.as_array()[1].as_map()['name'] or { json2.Any('') }).str() == '#'
+}
+
+fn be16(n int) []u8 {
+	return [u8(n >> 8), u8(n)]
+}
+
+fn be32(n int) []u8 {
+	return [u8(n >> 24), u8(n >> 16), u8(n >> 8), u8(n)]
+}
+
+fn mp4_box(typ string, body []u8) []u8 {
+	mut out := []u8{cap: 8 + body.len}
+	out << be32(8 + body.len)
+	out << typ.bytes()
+	out << body
+	return out
+}
+
+fn make_tagged_mp3(title string, jpg []u8, png []u8) []u8 {
+	mut tit2 := []u8{cap: 1 + title.len}
+	tit2 << u8(3) // UTF-8
+	tit2 << title.bytes()
+	mut frames := []u8{}
+	frames << 'TIT2'.bytes()
+	frames << be32(tit2.len)
+	frames << [u8(0), 0]
+	frames << tit2
+
+	// Non-front picture first (type 4 = back cover), then front cover (type 3) to verify preference.
+	if png.len > 0 {
+		mut apic_back := []u8{}
+		apic_back << u8(0)
+		apic_back << 'image/png'.bytes()
+		apic_back << u8(0)
+		apic_back << u8(4)
+		apic_back << u8(0)
+		apic_back << png
+		frames << 'APIC'.bytes()
+		frames << be32(apic_back.len)
+		frames << [u8(0), 0]
+		frames << apic_back
+	}
+	mut apic := []u8{}
+	apic << u8(0)
+	apic << 'image/jpeg'.bytes()
+	apic << u8(0)
+	apic << u8(3)
+	apic << u8(0)
+	apic << jpg
+	frames << 'APIC'.bytes()
+	frames << be32(apic.len)
+	frames << [u8(0), 0]
+	frames << apic
+
+	// Pad beyond 64 KB so MP3 frame detection uses b.seg beyond head.
+	pad := 70000
+	tag_sz := frames.len + pad
+	ss := [u8((tag_sz >> 21) & 0x7f), u8((tag_sz >> 14) & 0x7f), u8((tag_sz >> 7) & 0x7f),
+		u8(tag_sz & 0x7f)]
+	mut out := []u8{cap: 10 + tag_sz + 417 * 4}
+	out << 'ID3'.bytes()
+	out << [u8(3), 0, 0]
+	out << ss
+	out << frames
+	out << []u8{len: pad}
+	// MPEG-1 Layer III 128 kbps 44.1 kHz CBR frame (417 bytes).
+	for _ in 0 .. 4 {
+		out << [u8(0xff), 0xfb, 0x90, 0x00]
+		out << []u8{len: 413}
+	}
+	return out
+}
+
+fn test_bin_buffered_tags_and_native_artwork() {
+	dir := os.join_path(os.temp_dir(), 'vlyra_b3_tags_test')
+	os.rmdir_all(dir) or {}
+	os.mkdir_all(dir)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+
+	jpg := [u8(0xff), 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+		0x00, 0x01, 0xff, 0xd9]
+	png := [u8(0x89), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+		0x44, 0x52]
+
+	// 1. MP3 with ID3v2 > 64 KB + APIC preference.
+	mp3_path := os.join_path(dir, 'track.mp3')
+	mp3_bytes := make_tagged_mp3('Art Song', jpg, png)
+	os.write_file_array(mp3_path, mp3_bytes)!
+	fm := file_meta(mp3_path)
+	assert fm.size == mp3_bytes.len && fm.mtime > 0 && fm.added_at > 0
+	mt := native_tags_sized(mp3_path, '.mp3', fm.size) or { panic('mp3 tags missing') }
+	assert mt.title == 'Art Song' && mt.duration == 0 // 417*4 bytes at 128 kbps is < 1s
+	assert native_artwork(mp3_path, '.mp3') == jpg
+
+	// 2. FLAC with 70 KB padding block before METADATA_BLOCK_PICTURE.
+	flac_path := os.join_path(dir, 'track.flac')
+	mut si := []u8{len: 34}
+	// 44100 Hz (0x0ac44) + 441000 samples (10s)
+	si[10] = 0x0a
+	si[11] = 0xc4
+	si[12] = 0x40
+	si[15] = 0x06
+	si[16] = 0xba
+	si[17] = 0xa8
+	mut vc := []u8{}
+	vc << [u8(1), 0, 0, 0, `x`] // vendor 'x'
+	vc << [u8(1), 0, 0, 0] // 1 comment
+	c := 'TITLE=Flac Art'
+	vc << [u8(c.len), 0, 0, 0]
+	vc << c.bytes()
+	mut pic := []u8{}
+	pic << be32(3)
+	pic << be32(9)
+	pic << 'image/png'.bytes()
+	pic << be32(0) // description
+	pic << be32(1) // w
+	pic << be32(1) // h
+	pic << be32(24) // depth
+	pic << be32(0) // colors
+	pic << be32(png.len)
+	pic << png
+	pad_len := 70000
+	mut flac := 'fLaC'.bytes()
+	flac << [u8(0), 0, 0, u8(si.len)]
+	flac << si
+	flac << [u8(4), 0, 0, u8(vc.len)]
+	flac << vc
+	flac << [u8(1), u8(pad_len >> 16), u8(pad_len >> 8), u8(pad_len)]
+	flac << []u8{len: pad_len}
+	flac << [u8(0x86), 0, 0, u8(pic.len)]
+	flac << pic
+	os.write_file_array(flac_path, flac)!
+	ft := native_tags_sized(flac_path, '.flac', i64(flac.len)) or { panic('flac tags missing') }
+	assert ft.title == 'Flac Art' && ft.duration == 10
+	assert native_artwork(flac_path, '.flac') == png
+
+	// 3. MP4 with moov past 64 KB exercising load_window + covr extraction.
+	m4a_path := os.join_path(dir, 'track.m4a')
+	ftyp := mp4_box('ftyp', 'M4A '.bytes())
+	mdat := mp4_box('mdat', []u8{len: 70000})
+	mut mvhd := []u8{len: 20}
+	mvhd[12] = 0x00
+	mvhd[13] = 0x00
+	mvhd[14] = 0x03
+	mvhd[15] = 0xe8 // timescale = 1000
+	mvhd[16] = 0x00
+	mvhd[17] = 0x00
+	mvhd[18] = 0x3a
+	mvhd[19] = 0x98 // duration = 15000 (15s)
+	mut nam_data := []u8{}
+	nam_data << be32(1)
+	nam_data << be32(0)
+	nam_data << 'Mp4 Art'.bytes()
+	nam_box := mp4_box('\xa9nam', mp4_box('data', nam_data))
+	mut covr_data := []u8{}
+	covr_data << be32(13)
+	covr_data << be32(0)
+	covr_data << jpg
+	covr_box := mp4_box('covr', mp4_box('data', covr_data))
+	mut ilst_body := []u8{}
+	ilst_body << nam_box
+	ilst_body << covr_box
+	mut meta_body := [u8(0), 0, 0, 0]
+	meta_body << mp4_box('ilst', ilst_body)
+	udta := mp4_box('udta', mp4_box('meta', meta_body))
+	mut moov_body := mp4_box('mvhd', mvhd)
+	moov_body << udta
+	moov := mp4_box('moov', moov_body)
+	mut m4a := []u8{}
+	m4a << ftyp
+	m4a << mdat
+	m4a << moov
+	os.write_file_array(m4a_path, m4a)!
+	qt := native_tags_sized(m4a_path, '.m4a', i64(m4a.len)) or { panic('mp4 tags missing') }
+	assert qt.title == 'Mp4 Art' && qt.duration == 15
+	assert native_artwork(m4a_path, '.m4a') == jpg
+}
+
+fn test_artwork_content_dedup_and_etag() {
+	dir := os.join_path(os.temp_dir(), 'vlyra_b3_art_test')
+	os.rmdir_all(dir) or {}
+	os.mkdir_all(os.join_path(dir, 'art'))!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	jpg := [u8(0xff), 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+		0x00, 0x01, 0xff, 0xd9]
+	p1 := os.join_path(dir, 'a1.mp3')
+	p2 := os.join_path(dir, 'a2.mp3')
+	os.write_file_array(p1, make_tagged_mp3('T1', jpg, []u8{}))!
+	os.write_file_array(p2, make_tagged_mp3('T2', jpg, []u8{}))!
+
+	mut app := new_app(os.join_path(dir, 'v.db'), dir)!
+	for p in [p1, p2] {
+		it := Item{
+			path:  p
+			kind:  'audio'
+			title: 'T'
+		}
+		sql app.db {
+			insert it into Item
+		}!
+	}
+	items := app.items('', [])
+	assert items.len == 2
+
+	mut ctx1 := Context{}
+	send_artwork(mut ctx1, app, items[0], 0)
+	assert ctx1.res.body.bytes() == jpg
+	etag1 := ctx1.res.header.get(.etag) or { panic('missing etag') }
+	assert etag1.starts_with('"h_') && etag1.ends_with('"')
+
+	mut ctx2 := Context{}
+	send_artwork(mut ctx2, app, items[1], 0)
+	assert ctx2.res.body.bytes() == jpg
+	etag2 := ctx2.res.header.get(.etag) or { panic('missing etag') }
+	assert etag2 == etag1
+
+	art_files := os.ls(os.join_path(dir, 'art'))!
+	assert art_files.filter(it.starts_with('h_')).len == 1
+	assert '${items[0].id}.h' in art_files && '${items[1].id}.h' in art_files
+
+	mut ctx304 := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				header: http.new_header(key: .if_none_match, value: etag1)
+			}
+		}
+	}
+	send_artwork(mut ctx304, app, items[0], 0)
+	assert ctx304.res.status() == .not_modified && ctx304.res.body == ''
+}
+
+fn test_scan_fast_directory_skip() {
+	dir := os.join_path(os.temp_dir(), 'vlyra_b3_scanfast_test')
+	os.rmdir_all(dir) or {}
+	media := os.join_path(dir, 'media')
+	sub1 := os.join_path(media, 'sub1')
+	sub2 := os.join_path(media, 'sub2')
+	os.mkdir_all(sub1)!
+	os.mkdir_all(sub2)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	mp3_bytes := make_tagged_mp3('Fast1', [u8(0xff), 0xd8, 0xff, 0xd9], []u8{})
+	s1 := os.join_path(sub1, 's1.mp3')
+	os.write_file_array(s1, mp3_bytes)!
+	os.utime(s1, 1000000000, 1000000000)!
+	os.utime(sub2, 1000000000, 1000000000)!
+
+	mut app := new_app(os.join_path(dir, 'v.db'), dir)!
+	app.set('media_dir', media)
+	app.scan()
+	assert app.items('', []).len == 1
+
+	// Clear items without touching directory mtimes: scan_fast() must skip cleanly.
+	app.db.exec('delete from items')!
+	app.scan_fast()
+	assert app.items('', []).len == 0
+
+	// Touch sub2 by adding a new file -> scan_fast() detects mtime change and rescans.
+	s2 := os.join_path(sub2, 's2.mp3')
+	os.write_file_array(s2, mp3_bytes)!
+	os.utime(s2, 1000000000, 1000000000)!
+	app.scan_fast()
+	assert app.items('', []).len == 2
+}
+
+fn test_catalog_etag_and_gzip() {
+	mut app := new_app(':memory:', os.temp_dir())!
+	app.db.exec_param_many('insert into apps (name, token_hash, subsonic_password, scopes, enabled, created_at, last_seen) values (?, ?, ?, ?, 1, 1700000000, 0)', [
+		'player',
+		sha256.hexhash('tok-b3'),
+		'pass',
+		'library:read playlists:read history:write ratings:read',
+	])!
+	app.reload_apps()
+	for i in 0 .. 40 {
+		it := Item{
+			path:         '/m/g${i}.flac'
+			kind:         'audio'
+			title:        'Gzip Track Title Number ${i} Extra Padding Words'
+			artist:       'Artist ${i % 10}'
+			album_artist: 'Artist ${i % 10}'
+			album:        'Album ${i % 8}'
+			genre:        'Genre ${i % 4}'
+			year:         2000 + (i % 10)
+			duration:     200
+		}
+		sql app.db {
+			insert it into Item
+		}!
+	}
+	app.rebuild_catalog()
+
+	// 1. /api/v1/items returns ETag + gzip when payload >= 1400 bytes.
+	mut c_items := Context{
+		Context: veb.Context{
+			req:   http.Request{
+				method: .get
+				url:    '/api/v1/items?limit=100'
+				header: http.new_header_from_map({
+					.authorization:   'Bearer tok-b3'
+					.accept_encoding: 'gzip, deflate'
+				})
+			}
+			query: {
+				'limit': '100'
+			}
+		}
+	}
+	app.list_items(mut c_items)
+	assert (c_items.res.header.get(.content_encoding) or { '' }) == 'gzip'
+	assert (c_items.res.header.get(.vary) or { '' }) == 'Accept-Encoding'
+	etag := c_items.res.header.get(.etag) or { panic('missing items etag') }
+	plain_items := gzip.decompress(c_items.res.body.bytes())!.bytestr()
+	assert plain_items.contains('Gzip Track Title Number 0')
+
+	// 2. Matching If-None-Match returns 304 Not Modified with empty body.
+	mut c_304 := Context{
+		Context: veb.Context{
+			req:   http.Request{
+				method: .get
+				url:    '/api/v1/items?limit=100'
+				header: http.new_header_from_map({
+					.authorization: 'Bearer tok-b3'
+					.if_none_match: etag
+				})
+			}
+			query: {
+				'limit': '100'
+			}
+		}
+	}
+	app.list_items(mut c_304)
+	assert c_304.res.status() == .not_modified && c_304.res.body == ''
+
+	// 3. Mutating catalog invalidates ETag.
+	p := Principal{
+		name:   'player'
+		app_id: 1
+		scopes: ['library:read', 'ratings:read']
+	}
+	app.rate_album(p, 'Artist 0', 'Album 0', 5)!
+	mut c_new := Context{
+		Context: veb.Context{
+			req:   http.Request{
+				method: .get
+				url:    '/api/v1/items?limit=100'
+				header: http.new_header_from_map({
+					.authorization: 'Bearer tok-b3'
+					.if_none_match: etag
+				})
+			}
+			query: {
+				'limit': '100'
+			}
+		}
+	}
+	app.list_items(mut c_new)
+	assert c_new.res.status() != .not_modified
+	assert (c_new.res.header.get(.etag) or { '' }) != etag
+
+	// 4. Subsonic getArtists ETag + 304.
+	mut c_sub := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/getArtists?u=player&p=pass&f=json'
+			}
+		}
+	}
+	app.subsonic(mut c_sub, 'getArtists')
+	sub_etag := c_sub.res.header.get(.etag) or { panic('missing sub etag') }
+	mut c_sub_304 := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/getArtists?u=player&p=pass&f=json'
+				header: http.new_header(key: .if_none_match, value: sub_etag)
+			}
+		}
+	}
+	app.subsonic(mut c_sub_304, 'getArtists')
+	assert c_sub_304.res.status() == .not_modified && c_sub_304.res.body == ''
+}
+
+fn id3_frame(id string, payload []u8) []u8 {
+	mut out := []u8{cap: 10 + payload.len}
+	out << id.bytes()
+	out << be32(payload.len)
+	out << [u8(0), 0]
+	out << payload
+	return out
+}
+
+fn test_rich_metadata_and_embedded_lyrics() {
+	dir := os.join_path(os.temp_dir(), 'vlyra_b4_meta_test')
+	os.rmdir_all(dir) or {}
+	media := os.join_path(dir, 'media')
+	os.mkdir_all(media)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+
+	// 1. MP3 with TPOS, TXXX ReplayGain, USLT, SYLT (preferred), and valid CBR MPEG frames.
+	mut frames := []u8{}
+	frames << id3_frame('TIT2', [u8(3), `R`, `i`, `c`, `h`])
+	mut tpos := [u8(3)]
+	tpos << '2/2'.bytes()
+	frames << id3_frame('TPOS', tpos)
+	mut txxx := [u8(0)]
+	txxx << 'REPLAYGAIN_TRACK_GAIN\x00-6.52 dB'.bytes()
+	frames << id3_frame('TXXX', txxx)
+	mut txxxp := [u8(0)]
+	txxxp << 'REPLAYGAIN_TRACK_PEAK\x000.9876'.bytes()
+	frames << id3_frame('TXXX', txxxp)
+	mut uslt := [u8(3)]
+	uslt << 'eng'.bytes()
+	uslt << u8(0)
+	uslt << 'Unsynced'.bytes()
+	frames << id3_frame('USLT', uslt)
+	mut sylt := [u8(3)]
+	sylt << 'eng'.bytes()
+	sylt << [u8(2), 1, 0] // ms, lyrics, empty descriptor
+	sylt << 'First line'.bytes()
+	sylt << u8(0)
+	sylt << be32(1500)
+	sylt << 'Second line'.bytes()
+	sylt << u8(0)
+	sylt << be32(5000)
+	frames << id3_frame('SYLT', sylt)
+
+	ss := [u8((frames.len >> 21) & 0x7f), u8((frames.len >> 14) & 0x7f),
+		u8((frames.len >> 7) & 0x7f), u8(frames.len & 0x7f)]
+	mut mp3 := 'ID3'.bytes()
+	mp3 << [u8(3), 0, 0]
+	mp3 << ss
+	mp3 << frames
+	for _ in 0 .. 4 {
+		mp3 << [u8(0xff), 0xfb, 0x90, 0x00] // MPEG-1 L3 128kbps 44.1kHz stereo
+		mp3 << []u8{len: 413}
+	}
+	mp3_path := os.join_path(dir, 'rich.mp3')
+	os.write_file_array(mp3_path, mp3)!
+	mt := native_tags_sized(mp3_path, '.mp3', i64(mp3.len)) or { panic('mp3 missing') }
+	assert mt.disc == '2/2' && mt.bitrate == 128 && mt.sample_rate == 44100 && mt.channels == 2
+	assert mt.rg_track_gain == -6.52 && mt.rg_track_peak == 0.9876
+	assert mt.lyrics == '[00:01.50]First line\n[00:05.00]Second line'
+
+	// 2. FLAC with STREAMINFO (44100Hz, 2ch, 16bit, 10s), DISCNUMBER, LYRICS, REPLAYGAIN_ALBUM_GAIN.
+	mut si := []u8{len: 34}
+	si[10] = 0x0a
+	si[11] = 0xc4
+	si[12] = 0x42 // sr=44100, channels=(1+1)=2, bps_hi=0
+	si[13] = 0xf0 // bps_lo=15 -> bps=16
+	si[15] = 0x06
+	si[16] = 0xba
+	si[17] = 0xa8
+	mut vc := []u8{}
+	vc << [u8(1), 0, 0, 0, `x`]
+	comments := ['TITLE=Flac Rich', 'ARTIST=Singer', 'ALBUM=Record', 'DISCNUMBER=3',
+		'REPLAYGAIN_ALBUM_GAIN=-4.25 dB', 'LYRICS=Line one\nLine two']
+	vc << [u8(comments.len), 0, 0, 0]
+	for cm in comments {
+		vc << [u8(cm.len), 0, 0, 0]
+		vc << cm.bytes()
+	}
+	mut flac := 'fLaC'.bytes()
+	flac << [u8(0), 0, 0, u8(si.len)]
+	flac << si
+	flac << [u8(0x84), 0, 0, u8(vc.len)]
+	flac << vc
+	flac << []u8{len: 2000}
+	flac_path := os.join_path(media, 'rich.flac')
+	os.write_file_array(flac_path, flac)!
+	os.utime(flac_path, 1000000000, 1000000000)!
+	ft := native_tags_sized(flac_path, '.flac', i64(flac.len)) or { panic('flac missing') }
+	assert ft.disc == '3' && ft.sample_rate == 44100 && ft.channels == 2 && ft.bit_depth == 16
+	assert ft.bitrate > 0 && ft.rg_album_gain == -4.25 && ft.lyrics == 'Line one\nLine two'
+
+	// 3. MP4 with stsd (alac 48kHz 2ch 24bit), disk=2, ©lyr, ---- replaygain_track_gain.
+	mut stsd := []u8{len: 48}
+	stsd[7] = 1 // entry_count=1
+	copy(mut stsd[12..16], 'alac'.bytes())
+	stsd[32] = 0
+	stsd[33] = 2 // channels
+	stsd[34] = 0
+	stsd[35] = 24 // sample size
+	stsd[40] = 0xbb
+	stsd[41] = 0x80 // 48000 Hz
+	stsd_box := mp4_box('stsd', stsd)
+	trak := mp4_box('trak', mp4_box('mdia', mp4_box('minf', mp4_box('stbl', stsd_box))))
+	mut mvhd := []u8{len: 20}
+	copy(mut mvhd[12..16], be32(1000))
+	copy(mut mvhd[16..20], be32(10000))
+	mut disk_data := []u8{}
+	disk_data << be32(0)
+	disk_data << be32(0)
+	disk_data << [u8(0), 0, 0, 2, 0, 2, 0, 0]
+	mut lyr_data := []u8{}
+	lyr_data << be32(1)
+	lyr_data << be32(0)
+	lyr_data << 'Mp4 lyrics'.bytes()
+	mut ff_name := [u8(0), 0, 0, 0]
+	ff_name << 'replaygain_track_gain'.bytes()
+	mut ff_val := [u8(0), 0, 0, 0, 0, 0, 0, 0]
+	ff_val << '-3.10 dB'.bytes()
+	mut ff_body := mp4_box('name', ff_name)
+	ff_body << mp4_box('data', ff_val)
+	ff_box := mp4_box('----', ff_body)
+	mut ilst := []u8{}
+	ilst << mp4_box('disk', mp4_box('data', disk_data))
+	ilst << mp4_box('\xa9lyr', mp4_box('data', lyr_data))
+	ilst << ff_box
+	mut meta := [u8(0), 0, 0, 0]
+	meta << mp4_box('ilst', ilst)
+	mut moov_body := mp4_box('mvhd', mvhd)
+	moov_body << trak
+	moov_body << mp4_box('udta', mp4_box('meta', meta))
+	mut m4a := mp4_box('ftyp', 'M4A '.bytes())
+	m4a << mp4_box('mdat', []u8{len: 4000})
+	m4a << mp4_box('moov', moov_body)
+	m4a_path := os.join_path(dir, 'rich.m4a')
+	os.write_file_array(m4a_path, m4a)!
+	qt := native_tags_sized(m4a_path, '.m4a', i64(m4a.len)) or { panic('mp4 missing') }
+	assert qt.disc == '2' && qt.channels == 2 && qt.bit_depth == 24 && qt.sample_rate == 48000
+	assert qt.bitrate > 0 && qt.rg_track_gain == -3.1 && qt.lyrics == 'Mp4 lyrics'
+
+	// 4. Scan saves embedded lyrics cleanly, and rescan never clobbers user-edited lyrics + float json parity.
+	mut app := new_app(os.join_path(dir, 'v.db'), dir)!
+	app.set('media_dir', media)
+	app.scan()
+	got := app.items('', [])[0]
+	assert got.disc_no == 3 && got.rg_album_gain == -4.25
+	assert app.lyrics(got.id) == 'Line one\nLine two'
+	assert encode_item_page_json(&[got], 1, 0) == json2.encode(ItemPage{
+		items:  [got]
+		total:  1
+		rating: 0
+	})
+
+	app.set_lyrics(Principal{ name: 'admin', admin: true }, got.id, 'User Edited Lyrics')!
+	os.utime(flac_path, 1500000000, 1500000000)!
+	app.scan()
+	assert app.lyrics(got.id) == 'User Edited Lyrics'
+}
+
+fn test_subsonic_star_playqueue_and_apikey() {
+	mut app := new_app(':memory:', os.temp_dir())!
+	app.db.exec_param_many('insert into apps (name, token_hash, subsonic_password, scopes, enabled, created_at, last_seen) values (?, ?, ?, ?, 1, 1700000000, 0)', [
+		'apiuser',
+		sha256.hexhash('key-b4'),
+		'pass',
+		'library:read ratings:read ratings:write history:write',
+	])!
+	app.reload_apps()
+	for i in 1 .. 4 {
+		it := Item{
+			path:          '/m/s${i}.flac'
+			kind:          'audio'
+			title:         'Star ${i}'
+			artist:        'Star Artist'
+			album_artist:  'Star Artist'
+			album:         'Star Album'
+			track_no:      i
+			disc_no:       2
+			duration:      180
+			bitrate:       950
+			sample_rate:   44100
+			bit_depth:     16
+			channels:      2
+			rg_track_gain: -5.5
+		}
+		sql app.db {
+			insert it into Item
+		}!
+	}
+	app.rebuild_catalog()
+
+	// Bad apiKey -> code 44.
+	mut c_bad := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/ping?apiKey=wrong&f=json'
+			}
+		}
+	}
+	app.subsonic(mut c_bad, 'ping')
+	bad_m := json2.decode[json2.Any](c_bad.res.body)!.as_map()['subsonic-response'] or {
+		json2.Any('')
+	}.as_map()
+	assert ((bad_m['error'] or { json2.Any('') }).as_map()['code'] or { json2.Any(0) }).int() == 44
+
+	// Extensions advertise apiKeyAuthentication + apiKey auth succeeds.
+	mut c_ext := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/getOpenSubsonicExtensions?apiKey=key-b4&f=json'
+			}
+		}
+	}
+	app.subsonic(mut c_ext, 'getOpenSubsonicExtensions')
+	assert c_ext.res.body.contains('apiKeyAuthentication')
+
+	// Star item 1, album, artist.
+	al_id := album_id('Star Artist', 'Star Album')
+	ar_id := artist_id('Star Artist')
+	mut c_star := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/star?apiKey=key-b4&f=json&id=1&albumId=${al_id}&artistId=${ar_id}'
+			}
+		}
+	}
+	app.subsonic(mut c_star, 'star')
+	assert c_star.res.body.contains('"status":"ok"')
+
+	// getStarred2 + getAlbumList2?type=starred.
+	mut c_gs := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/getStarred2?apiKey=key-b4&f=json'
+			}
+		}
+	}
+	app.subsonic(mut c_gs, 'getStarred2')
+	gs := (json2.decode[json2.Any](c_gs.res.body)!.as_map()['subsonic-response'] or { json2.Any('') }).as_map()['starred2'] or {
+		json2.Any('')
+	}.as_map()
+	gs_songs := (gs['song'] or { json2.Any([]json2.Any{}) }).as_array()
+	assert gs_songs.len == 1
+	s0 := gs_songs[0].as_map()
+	assert (s0['discNumber'] or { json2.Any(0) }).int() == 2
+		&& (s0['bitRate'] or { json2.Any(0) }).int() == 950
+		&& (s0['samplingRate'] or { json2.Any(0) }).int() == 44100
+		&& 'replayGain' in s0 && 'starred' in s0
+	assert (gs['album'] or { json2.Any([]json2.Any{}) }).as_array().len == 1
+	assert (gs['artist'] or { json2.Any([]json2.Any{}) }).as_array().len == 1
+
+	mut c_gal := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/getAlbumList2?apiKey=key-b4&f=json&type=starred'
+			}
+		}
+	}
+	app.subsonic(mut c_gal, 'getAlbumList2')
+	assert c_gal.res.body.contains('Star Album')
+
+	// Unstar song 1 -> gone from starred songs.
+	mut c_us := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/unstar?apiKey=key-b4&f=json&id=1'
+			}
+		}
+	}
+	app.subsonic(mut c_us, 'unstar')
+	mut c_gs2 := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/getStarred2?apiKey=key-b4&f=json'
+			}
+		}
+	}
+	app.subsonic(mut c_gs2, 'getStarred2')
+	gs2 := (json2.decode[json2.Any](c_gs2.res.body)!.as_map()['subsonic-response'] or {
+		json2.Any('')
+	}).as_map()['starred2'] or { json2.Any('') }.as_map()
+	assert (gs2['song'] or { json2.Any([]json2.Any{}) }).as_array().len == 0
+
+	// savePlayQueue & getPlayQueue + clear.
+	mut c_spq := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/savePlayQueue?apiKey=key-b4&f=json&id=3&id=1&current=1&position=42000'
+			}
+		}
+	}
+	app.subsonic(mut c_spq, 'savePlayQueue')
+	mut c_gpq := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/getPlayQueue?apiKey=key-b4&f=json'
+			}
+		}
+	}
+	app.subsonic(mut c_gpq, 'getPlayQueue')
+	pq := (json2.decode[json2.Any](c_gpq.res.body)!.as_map()['subsonic-response'] or {
+		json2.Any('')
+	}).as_map()['playQueue'] or { json2.Any('') }.as_map()
+	assert (pq['current'] or { json2.Any('') }).str() == '1'
+		&& (pq['position'] or { json2.Any(0) }).i64() == 42000
+	entries := (pq['entry'] or { json2.Any([]json2.Any{}) }).as_array()
+	assert entries.len == 2 && (entries[0].as_map()['id'] or { json2.Any('') }).str() == '3'
+		&& (entries[1].as_map()['id'] or { json2.Any('') }).str() == '1'
+
+	mut c_cpq := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/savePlayQueue?apiKey=key-b4&f=json'
+			}
+		}
+	}
+	app.subsonic(mut c_cpq, 'savePlayQueue')
+	mut c_gpq2 := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/rest/getPlayQueue?apiKey=key-b4&f=json'
+			}
+		}
+	}
+	app.subsonic(mut c_gpq2, 'getPlayQueue')
+	assert !c_gpq2.res.body.contains('playQueue')
+}
+
+fn test_jellyfin_search_hints_counts_and_favorites() {
+	mut app := new_app(':memory:', os.temp_dir())!
+	app.db.exec_param_many('insert into apps (name, token_hash, subsonic_password, scopes, enabled, created_at, last_seen) values (?, ?, ?, ?, 1, 1700000000, 0)', [
+		'jfuser',
+		sha256.hexhash('jf-tok'),
+		'',
+		'library:read ratings:read ratings:write',
+	])!
+	app.reload_apps()
+	it := Item{
+		path:          '/m/v1.flac'
+		kind:          'audio'
+		title:         'Vessel Theme'
+		artist:        'Harbour'
+		album_artist:  'Harbour'
+		album:         'Vessel Album'
+		disc_no:       2
+		bitrate:       800
+		sample_rate:   48000
+		bit_depth:     24
+		channels:      2
+		rg_track_gain: -2.5
+		duration:      200
+	}
+	sql app.db {
+		insert it into Item
+	}!
+	app.rebuild_catalog()
+
+	mut c_cnt := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/Items/Counts?api_key=jf-tok'
+			}
+		}
+	}
+	app.jellyfin(mut c_cnt, 'Items/Counts')
+	cnt := json2.decode[json2.Any](c_cnt.res.body)!.as_map()
+	assert (cnt['SongCount'] or { json2.Any(0) }).int() == 1
+		&& (cnt['AlbumCount'] or { json2.Any(0) }).int() == 1
+		&& (cnt['ArtistCount'] or { json2.Any(0) }).int() == 1
+
+	mut c_hints := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/Search/Hints?searchTerm=Vessel&api_key=jf-tok'
+			}
+		}
+	}
+	app.jellyfin(mut c_hints, 'Search/Hints')
+	hints := (json2.decode[json2.Any](c_hints.res.body)!.as_map()['SearchHints'] or {
+		json2.Any([]json2.Any{})
+	}).as_array()
+	assert hints.len >= 2
+
+	jid := jf_item_id(1)
+	mut c_fav := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .post
+				url:    '/Users/u/FavoriteItems/${jid}?api_key=jf-tok'
+			}
+		}
+	}
+	app.jellyfin(mut c_fav, 'Users/u/FavoriteItems/${jid}')
+	assert (json2.decode[json2.Any](c_fav.res.body)!.as_map()['IsFavorite'] or { json2.Any(false) }).bool()
+
+	mut c_list := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .get
+				url:    '/Items?Filters=IsFavorite&IncludeItemTypes=Audio&api_key=jf-tok'
+			}
+		}
+	}
+	app.jellyfin(mut c_list, 'Items')
+	fav_items := (json2.decode[json2.Any](c_list.res.body)!.as_map()['Items'] or {
+		json2.Any([]json2.Any{})
+	}).as_array()
+	assert fav_items.len == 1
+	assert (fav_items[0].as_map()['ParentIndexNumber'] or { json2.Any(0) }).int() == 2
+
+	mut c_unfav := Context{
+		Context: veb.Context{
+			req: http.Request{
+				method: .delete
+				url:    '/Users/u/FavoriteItems/${jid}?api_key=jf-tok'
+			}
+		}
+	}
+	app.jellyfin(mut c_unfav, 'Users/u/FavoriteItems/${jid}')
+	assert !(json2.decode[json2.Any](c_unfav.res.body)!.as_map()['IsFavorite'] or { json2.Any(true) }).bool()
+}
+
+fn test_sqlite_stmt_cache_pool() {
+	dir := os.join_path(os.temp_dir(), 'vlyra_b4_pool_test')
+	os.rmdir_all(dir) or {}
+	os.mkdir_all(dir)!
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	mut app := new_app(os.join_path(dir, 'v.db'), dir)!
+	assert app.read_pool.len >= 4
+	for i in 1 .. 5 {
+		it := Item{
+			path:         '/m/p${i}.flac'
+			kind:         'audio'
+			title:        'Pool ${i}'
+			artist:       'Pool Artist'
+			album_artist: 'Pool Artist'
+			album:        'Pool Album ${i % 2}'
+			genre:        'Jazz'
+			track_no:     i
+			disc_no:      1
+			duration:     120
+			bitrate:      900
+			sample_rate:  44100
+			bit_depth:    16
+			channels:     2
+		}
+		sql app.db {
+			insert it into Item
+		}!
+	}
+	app.rebuild_catalog()
+
+	// Run enough times to exercise statement cache hits across all connections in read_pool.
+	for _ in 0 .. 20 {
+		als := app.albums_mat(false, 'order by album collate nocase', [])
+		assert als.len == 2
+		ars := app.artists_mat('artist', 'order by name collate nocase', [])
+		assert ars.len == 1
+		grs := app.genres_mat()
+		assert grs.len == 1 && grs[0].songs == 4
+		its := app.items('where ${audio} order by disc_no, track_no', [])
+		assert its.len == 4 && its[0].bitrate == 900
+		one := app.item(1) or { panic('item 1 missing') }
+		assert one.sample_rate == 44100 && one.bit_depth == 16
+	}
+	mut cached := 0
+	for rc in app.read_pool {
+		cached += rc.stmts.len
+	}
+	assert cached >= app.read_pool.len
 }

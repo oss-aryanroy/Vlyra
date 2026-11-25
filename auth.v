@@ -155,11 +155,11 @@ fn (app &App) session_ok(token string) bool {
 	if token == '' {
 		return false
 	}
-	rows := app.reader().exec_param_many('select 1 from sessions where token = ? and expires > ?', [
+	v := app.fast_q_int('select 1 from sessions where token = ? and expires > ?', [
 		sha256.hexhash(token),
 		time.now().unix().str(),
 	]) or { return false }
-	return rows.len > 0
+	return v == 1
 }
 
 fn (mut app App) identify(ctx &Context) ?Principal {

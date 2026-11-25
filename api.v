@@ -1,5 +1,6 @@
 module main
 
+import compress.gzip
 import crypto.bcrypt
 import crypto.sha256
 import net
@@ -12,6 +13,65 @@ import x.json2
 
 const max_artwork = 10 * 1024 * 1024
 const stream_chunk_threshold = i64(256 * 1024)
+const gzip_min_bytes = 1400
+
+fn etag_matches(ctx &Context, tag string) bool {
+	raw := ctx.get_header(.if_none_match) or { return false }
+	if raw == tag || raw == '*' {
+		return true
+	}
+	hdr := raw.trim_space()
+	if hdr == '' {
+		return false
+	}
+	if hdr == '*' || hdr == tag {
+		return true
+	}
+	for part in hdr.split(',') {
+		mut item := part.trim_space()
+		if item.starts_with('W/') {
+			item = item[2..].trim_space()
+		}
+		if item == tag {
+			return true
+		}
+	}
+	return false
+}
+
+fn not_modified(mut ctx Context, tag string, cc string) veb.Result {
+	ctx.set_header(.etag, tag)
+	if cc != '' {
+		ctx.set_header(.cache_control, cc)
+	}
+	ctx.res.set_status(.not_modified)
+	return ctx.send_response_to_client('', '')
+}
+
+fn accepts_gzip(ctx &Context) bool {
+	ae := ctx.get_header(.accept_encoding) or { return false }
+	if ae.contains('gzip') {
+		return true
+	}
+	if ae.contains('G') || ae.contains('Z') {
+		return ae.to_lower().contains('gzip')
+	}
+	return false
+}
+
+fn send_json(mut ctx Context, body string) veb.Result {
+	if body.len >= gzip_min_bytes {
+		if accepts_gzip(ctx) {
+			if gz := gzip.compress(body.bytes()) {
+				ctx.set_header(.content_encoding, 'gzip')
+				ctx.set_header(.vary, 'Accept-Encoding')
+				return ctx.send_response_to_client('application/json', gz.bytestr())
+			}
+		}
+		ctx.set_header(.vary, 'Accept-Encoding')
+	}
+	return ctx.send_response_to_client('application/json', body)
+}
 
 fn fail(mut ctx Context, status http.Status, msg string) veb.Result {
 	ctx.res.set_status(status)
@@ -125,7 +185,49 @@ fn (app &App) art_path(id int) string {
 	return os.join_path(app.data_dir, 'art', id.str())
 }
 
+fn (app &App) art_blob_path(hash string) string {
+	return os.join_path(app.data_dir, 'art', 'h_${hash}')
+}
+
+fn (app &App) art_ref_path(id int) string {
+	return os.join_path(app.data_dir, 'art', '${id}.h')
+}
+
+fn atomic_write_bytes(path string, data []u8) ! {
+	tmp := '${path}.${rand.u32()}.tmp'
+	mut f := os.create(tmp)!
+	f.write(data) or {
+		f.close()
+		os.rm(tmp) or {}
+		return err
+	}
+	f.close()
+	os.mv(tmp, path) or {
+		os.rm(tmp) or {}
+		return err
+	}
+}
+
+fn (app &App) store_art_blob(id int, data []u8) !string {
+	hash := sha256.sum(data).hex()[..32]
+	blob := app.art_blob_path(hash)
+	if !os.exists(blob) || os.file_size(blob) == 0 {
+		atomic_write_bytes(blob, data)!
+	}
+	atomic_write_bytes(app.art_ref_path(id), hash.bytes())!
+	return blob
+}
+
 fn (app &App) artwork(it Item) ?string {
+	if ref := os.read_file(app.art_ref_path(it.id)) {
+		h := ref.trim_space()
+		if h != '' {
+			blob := app.art_blob_path(h)
+			if os.exists(blob) && os.file_size(blob) > 0 {
+				return blob
+			}
+		}
+	}
 	own := app.art_path(it.id)
 	if os.exists(own) && os.file_size(own) > 0 {
 		return own
@@ -136,13 +238,33 @@ fn (app &App) artwork(it Item) ?string {
 			return sidecar
 		}
 	}
-	if !os.exists(own) && app.ffmpeg != '' {
-		app.ffmpeg_image(['-i', it.path, '-an'], own)
-		if os.exists(own) && os.file_size(own) > 0 {
-			return own
-		}
-		os.write_file(own, '') or {}
+	// Empty `own` caches negative embedded-art probes so subsequent requests don't re-run native/ffmpeg.
+	if os.exists(own) {
+		return none
 	}
+	ext := os.file_ext(it.path).to_lower()
+	native_img := native_artwork(it.path, ext)
+	if native_img.len > 0 {
+		if blob := app.store_art_blob(it.id, native_img) {
+			return blob
+		}
+	}
+	if app.ffmpeg != '' {
+		tmp := '${own}.${rand.u32()}.tmp'
+		app.ffmpeg_image(['-i', it.path, '-an'], tmp)
+		if os.exists(tmp) && os.file_size(tmp) > 0 {
+			if bytes := os.read_bytes(tmp) {
+				os.rm(tmp) or {}
+				if bytes.len > 0 {
+					if blob := app.store_art_blob(it.id, bytes) {
+						return blob
+					}
+				}
+			}
+		}
+		os.rm(tmp) or {}
+	}
+	os.write_file(own, '') or {}
 	return none
 }
 
@@ -165,7 +287,12 @@ fn (app &App) thumb(path string, id int, want int) string {
 		return path
 	}
 	size := thumb_sizes.filter(it >= want)[0]
-	out := '${app.art_path(id)}.${size}'
+	base := os.file_name(path)
+	out := if base.starts_with('h_') {
+		os.join_path(app.data_dir, 'art', '${base}.${size}')
+	} else {
+		'${app.art_path(id)}.${size}'
+	}
 	if !os.exists(out) || os.file_last_mod_unix(out) < os.file_last_mod_unix(path) {
 		app.ffmpeg_image(['-i', path, '-vf', "scale='min(${size},iw)':-2", '-q:v', '4'], out)
 	}
@@ -176,9 +303,19 @@ fn (app &App) thumb(path string, id int, want int) string {
 fn send_artwork(mut ctx Context, app &App, it Item, size int) veb.Result {
 	full := app.artwork(it) or { return fail(mut ctx, .not_found, 'no artwork') }
 	path := app.thumb(full, it.id, size)
+	fname := os.file_name(path)
+	tag := if fname.starts_with('h_') {
+		'"${fname}"'
+	} else {
+		'"${it.id}-${size}-${os.file_last_mod_unix(path)}-${os.file_size(path)}"'
+	}
+	if etag_matches(ctx, tag) {
+		return not_modified(mut ctx, tag, 'public, max-age=86400')
+	}
 	data := os.read_file(path) or { return fail(mut ctx, .not_found, 'no artwork') }
 	mime := image_mime(data)
 	// public lets the CDN cache covers, which it then serves without sign-in.
+	ctx.set_header(.etag, tag)
 	ctx.set_header(.cache_control, 'public, max-age=86400')
 	return ctx.send_response_to_client(if mime != '' { mime } else { 'image/jpeg' }, data)
 }
@@ -281,33 +418,51 @@ pub fn (mut app App) list_items(mut ctx Context) veb.Result {
 		limit = 200
 	}
 	if 'album' in ctx.query {
-		found := app.items('where missing = 0 and ${album_match} order by track_no, title collate nocase', [
+		rated := p.can('ratings:read')
+		key := sha256.sum('${rated}:${ctx.query['artist']}:${ctx.query['album']}'.bytes()).hex()[..16]
+		tag := '"v${app.catalog_version()}-album-${key}"'
+		if etag_matches(ctx, tag) {
+			return not_modified(mut ctx, tag, 'private, no-cache')
+		}
+		found := app.items('where missing = 0 and ${album_match} order by disc_no, track_no, title collate nocase', [
 			ctx.query['artist'],
 			ctx.query['album'],
 		])
-		rating := if p.can('ratings:read') {
+		rating := if rated {
 			app.album_rating(ctx.query['artist'], ctx.query['album'])
 		} else {
 			0
 		}
-		return ctx.send_response_to_client('application/json', encode_item_page_json(&found,
-			found.len, rating))
+		ctx.set_header(.etag, tag)
+		ctx.set_header(.cache_control, 'private, no-cache')
+		return send_json(mut ctx, encode_item_page_json(&found, found.len, rating))
 	}
 	offset := if ctx.query['offset'].int() > 0 { ctx.query['offset'].int() } else { 0 }
 	q_str := ctx.query['q'].trim_space()
 	if q_str == '' {
-		total := app.reader().q_int('select count(*) from items where missing = 0') or { 0 }
-		found := app.items('where missing = 0 order by artist collate nocase, album collate nocase, track_no, title collate nocase limit ? offset ?', [
+		tag := '"v${app.catalog_version()}-items-${limit}-${offset}"'
+		if etag_matches(ctx, tag) {
+			return not_modified(mut ctx, tag, 'private, no-cache')
+		}
+		total := app.fast_q_int('select count(*) from items where missing = 0', []) or { 0 }
+		found := app.items('where missing = 0 order by artist collate nocase, album collate nocase, disc_no, track_no, title collate nocase limit ? offset ?', [
 			limit.str(),
 			offset.str(),
 		])
-		return ctx.send_response_to_client('application/json', encode_item_page_json(&found,
-			total, 0))
+		ctx.set_header(.etag, tag)
+		ctx.set_header(.cache_control, 'private, no-cache')
+		return send_json(mut ctx, encode_item_page_json(&found, total, 0))
+	}
+	key := sha256.sum('${limit}:${offset}:${q_str}'.bytes()).hex()[..16]
+	tag := '"v${app.catalog_version()}-itemsq-${key}"'
+	if etag_matches(ctx, tag) {
+		return not_modified(mut ctx, tag, 'private, no-cache')
 	}
 	found := app.search_items_fts(q_str, '', false, '', limit, offset)
 	total := app.search_items_fts_count(q_str, '', false, '')
-	return ctx.send_response_to_client('application/json', encode_item_page_json(&found,
-		total, 0))
+	ctx.set_header(.etag, tag)
+	ctx.set_header(.cache_control, 'private, no-cache')
+	return send_json(mut ctx, encode_item_page_json(&found, total, 0))
 }
 
 @['/api/v1/albums']
@@ -315,13 +470,24 @@ pub fn (mut app App) list_albums(mut ctx Context) veb.Result {
 	p := app.auth(ctx, 'library:read') or { return deny(mut ctx, err) }
 	q_str := ctx.query['q'].trim_space()
 	rated := p.can('ratings:read')
+	tag := if q_str == '' {
+		'"v${app.catalog_version()}-albums-${rated}"'
+	} else {
+		key := sha256.sum(q_str.bytes()).hex()[..16]
+		'"v${app.catalog_version()}-albumsq-${rated}-${key}"'
+	}
+	if etag_matches(ctx, tag) {
+		return not_modified(mut ctx, tag, 'private, no-cache')
+	}
 	found := if q_str == '' {
 		app.albums_mat(rated, 'order by album_artist collate nocase, year, album collate nocase',
 			[])
 	} else {
 		app.search_albums_fts(rated, q_str, '', 100000, 0)
 	}
-	return ctx.send_response_to_client('application/json', encode_albums_json(&found))
+	ctx.set_header(.etag, tag)
+	ctx.set_header(.cache_control, 'private, no-cache')
+	return send_json(mut ctx, encode_albums_json(&found))
 }
 
 @['/api/v1/albums/rating'; put]
@@ -408,7 +574,8 @@ fn (mut app App) set_artwork(p Principal, id int, data string) ! {
 	if image_mime(data) == '' || data.len > max_artwork {
 		return error('body must be a JPEG, PNG, WebP or GIF image up to 10 MB')
 	}
-	os.write_file(app.art_path(id), data)!
+	app.store_art_blob(id, data.bytes())!
+	os.rm(app.art_path(id)) or {}
 	for size in thumb_sizes {
 		os.rm('${app.art_path(id)}.${size}') or {}
 	}

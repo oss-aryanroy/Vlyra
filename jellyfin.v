@@ -47,17 +47,21 @@ fn jf_names(artist string) []json2.Any {
 	return [json2.Any(o)]
 }
 
-fn jf_userdata(key string, plays int, last_played i64) json2.Any {
+fn jf_userdata_fav(key string, plays int, last_played i64, fav bool) json2.Any {
 	mut u := map[string]json2.Any{}
 	u['PlaybackPositionTicks'] = 0
 	u['PlayCount'] = plays
-	u['IsFavorite'] = false
+	u['IsFavorite'] = fav
 	u['Played'] = plays > 0
 	if last_played > 0 {
 		u['LastPlayedDate'] = iso(last_played)
 	}
 	u['Key'] = key
 	return u
+}
+
+fn jf_userdata(key string, plays int, last_played i64) json2.Any {
+	return jf_userdata_fav(key, plays, last_played, false)
 }
 
 fn jf_image(first_id int) json2.Any {
@@ -70,7 +74,7 @@ fn (app &App) jf_server_id() string {
 	return app.server_id
 }
 
-fn (app &App) jf_song(it Item) json2.Any {
+fn (app &App) jf_song_ex(it Item, fav bool) json2.Any {
 	ext := os.file_ext(it.path).to_lower().trim_left('.')
 	id := jf_item_id(it.id)
 	id_str := it.id.str()
@@ -85,6 +89,18 @@ fn (app &App) jf_song(it Item) json2.Any {
 	stream['Codec'] = ext
 	stream['Index'] = 0
 	stream['IsDefault'] = true
+	if it.bitrate > 0 {
+		stream['BitRate'] = it.bitrate * 1000
+	}
+	if it.sample_rate > 0 {
+		stream['SampleRate'] = it.sample_rate
+	}
+	if it.bit_depth > 0 {
+		stream['BitDepth'] = it.bit_depth
+	}
+	if it.channels > 0 {
+		stream['Channels'] = it.channels
+	}
 	mut src := map[string]json2.Any{}
 	src['Id'] = id
 	src['Name'] = it.title
@@ -92,6 +108,9 @@ fn (app &App) jf_song(it Item) json2.Any {
 	src['Type'] = 'Default'
 	src['Container'] = ext
 	src['Size'] = it.size
+	if it.bitrate > 0 {
+		src['Bitrate'] = it.bitrate * 1000
+	}
 	src['RunTimeTicks'] = i64(it.duration) * jf_ticks
 	src['SupportsDirectPlay'] = true
 	src['SupportsDirectStream'] = true
@@ -109,6 +128,12 @@ fn (app &App) jf_song(it Item) json2.Any {
 	s['Container'] = ext
 	s['RunTimeTicks'] = i64(it.duration) * jf_ticks
 	s['IndexNumber'] = it.track_no
+	if it.disc_no > 0 {
+		s['ParentIndexNumber'] = it.disc_no
+	}
+	if it.rg_track_gain != 0 {
+		s['NormalizationGain'] = it.rg_track_gain
+	}
 	s['ProductionYear'] = it.year
 	s['Album'] = or_unknown(it.album, 'Album')
 	s['AlbumId'] = al_id
@@ -121,12 +146,16 @@ fn (app &App) jf_song(it Item) json2.Any {
 	s['DateCreated'] = iso(it.added_at)
 	s['ImageTags'] = jf_image(it.id)
 	s['AlbumPrimaryImageTag'] = id_str
-	s['UserData'] = jf_userdata(id, it.play_count, it.last_played)
+	s['UserData'] = jf_userdata_fav(id, it.play_count, it.last_played, fav)
 	s['MediaSources'] = [json2.Any(src)]
 	return s
 }
 
-fn (app &App) jf_album(al Album) json2.Any {
+fn (app &App) jf_song(it Item) json2.Any {
+	return app.jf_song_ex(it, app.is_starred('item', it.id.str()))
+}
+
+fn (app &App) jf_album_ex(al Album, fav bool) json2.Any {
 	id := jf_album_id(al.artist, al.name)
 	ar_name := or_unknown(al.artist, 'Artist')
 	ar_items := jf_names(al.artist)
@@ -147,11 +176,15 @@ fn (app &App) jf_album(al Album) json2.Any {
 	a['Genres'] = if al.genre != '' { [json2.Any(al.genre)] } else { []json2.Any{} }
 	a['DateCreated'] = iso(al.added_at)
 	a['ImageTags'] = jf_image(al.first_id)
-	a['UserData'] = jf_userdata(id, al.play_count, al.last_played)
+	a['UserData'] = jf_userdata_fav(id, al.play_count, al.last_played, fav)
 	return a
 }
 
-fn (app &App) jf_artist(ar ArtistRow) json2.Any {
+fn (app &App) jf_album(al Album) json2.Any {
+	return app.jf_album_ex(al, app.is_starred('album', '${al.artist}\x1f${al.name}'))
+}
+
+fn (app &App) jf_artist_ex(ar ArtistRow, fav bool) json2.Any {
 	id := jf_artist_id(ar.name)
 	mut a := map[string]json2.Any{}
 	a['Name'] = or_unknown(ar.name, 'Artist')
@@ -161,8 +194,12 @@ fn (app &App) jf_artist(ar ArtistRow) json2.Any {
 	a['IsFolder'] = true
 	a['AlbumCount'] = ar.albums
 	a['ImageTags'] = jf_image(ar.first_id)
-	a['UserData'] = jf_userdata(id, 0, 0)
+	a['UserData'] = jf_userdata_fav(id, 0, 0, fav)
 	return a
+}
+
+fn (app &App) jf_artist(ar ArtistRow) json2.Any {
+	return app.jf_artist_ex(ar, app.is_starred('artist', ar.name))
 }
 
 fn (app &App) jf_playlist_summary(ps PlaylistSummary) json2.Any {
@@ -315,7 +352,18 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 	nothing := jf_page([], 0, start)
 
 	if q['filters'].to_lower().contains('isfavorite') || q['isfavorite'] == 'true' {
-		return nothing
+		if types.contains('musicalbum') {
+			favs := app.starred_albums(false, limit, start)
+			return jf_page(favs.map(app.jf_album_ex(it, true)), favs.len, start)
+		}
+		if types.contains('musicartist') {
+			favs := app.starred_artists()
+			from, to := jf_bounds(favs.len, start, limit)
+			return jf_page(favs[from..to].map(app.jf_artist_ex(it, true)), favs.len, start)
+		}
+		favs := app.starred_items()
+		from, to := jf_bounds(favs.len, start, limit)
+		return jf_page(favs[from..to].map(app.jf_song_ex(it, true)), favs.len, start)
 	}
 	if q['ids'] != '' {
 		mut out := []json2.Any{}
@@ -344,7 +392,7 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 	} else if sort_by.starts_with('sortname') || sort_by.starts_with('name') {
 		'title collate nocase ${dir}'
 	} else {
-		'artist collate nocase, album collate nocase, track_no'
+		'artist collate nocase, album collate nocase, disc_no, track_no'
 	}
 	album_order := if sort_by.contains('random') {
 		'random()'
@@ -368,7 +416,7 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 	if album_ref !in ['', jf_view] {
 		if al := app.jf_find_album(album_ref) {
 			return app.jf_songs('and ${album_match}', [al.artist, al.name],
-				'track_no, title collate nocase', start, limit)
+				'disc_no, track_no, title collate nocase', start, limit)
 		}
 	}
 	artist_ref := jf_norm((q['albumartistids'] + ',' + q['artistids'] + ',' +
@@ -454,7 +502,7 @@ fn (app &App) jf_items(p Principal, q map[string]string) json2.Any {
 }
 
 fn jf_send(mut ctx Context, v json2.Any) veb.Result {
-	return ctx.send_response_to_client('application/json', v.json_str())
+	return send_json(mut ctx, v.json_str())
 }
 
 fn jf_token(ctx &Context, q map[string]string) string {
@@ -596,7 +644,36 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 		})
 	}
 	if a in ['favoriteitems', 'userfavoriteitems'] {
-		return jf_send(mut ctx, jf_userdata(id, 0, 0))
+		write := post || ctx.req.method == .delete
+		if write && !p.can('ratings:write') {
+			return forbidden('ratings:write')
+		}
+		mut kind := ''
+		mut key := ''
+		mut plays := 0
+		mut last_played := i64(0)
+		if row_id := app.item(jf_row(id, `1`)) {
+			kind = 'item'
+			key = row_id.id.str()
+			plays = row_id.play_count
+			last_played = row_id.last_played
+		} else if al := app.jf_find_album(id) {
+			kind = 'album'
+			key = '${al.artist}\x1f${al.name}'
+			plays = al.play_count
+			last_played = al.last_played
+		} else if ar := app.jf_find_artist(id) {
+			kind = 'artist'
+			key = ar.name
+		} else {
+			return ctx.not_found()
+		}
+		if write {
+			app.set_star(p, kind, key, post) or { return ctx.not_found() }
+			return jf_send(mut ctx, jf_userdata_fav(id, plays, last_played, post))
+		}
+		return jf_send(mut ctx, jf_userdata_fav(id, plays, last_played, app.is_starred(kind,
+			key)))
 	}
 	if a == 'displaypreferences' {
 		mut o := map[string]json2.Any{}
@@ -608,6 +685,84 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 	}
 	if !p.can('library:read') {
 		return forbidden('library:read')
+	}
+	if a == 'search' && id == 'hints' {
+		term := q['searchterm'].trim_space()
+		limit := if q['limit'].int() > 0 { q['limit'].int() } else { 20 }
+		types := q['includeitemtypes'].to_lower()
+		mut hints := []json2.Any{}
+		if term != '' {
+			want_song := types == '' || types.contains('audio')
+			want_album := types == '' || types.contains('musicalbum')
+			want_artist := types == '' || types.contains('musicartist')
+			if want_song {
+				for it in app.search_items_fts(term, 'title artist album', true, '', limit,
+					0) {
+					jid := jf_item_id(it.id)
+					mut h := map[string]json2.Any{}
+					h['ItemId'] = jid
+					h['Id'] = jid
+					h['Name'] = it.title
+					h['Type'] = 'Audio'
+					h['MediaType'] = 'Audio'
+					h['Album'] = or_unknown(it.album, 'Album')
+					h['AlbumId'] = jf_album_id(it.album_artist, it.album)
+					h['AlbumArtist'] = or_unknown(if it.album_artist != '' {
+						it.album_artist
+					} else {
+						it.artist
+					}, 'Artist')
+					h['Artists'] = [json2.Any(or_unknown(it.artist, 'Artist'))]
+					h['ProductionYear'] = it.year
+					h['RunTimeTicks'] = i64(it.duration) * jf_ticks
+					h['PrimaryImageTag'] = it.id.str()
+					hints << h
+					if hints.len >= limit {
+						break
+					}
+				}
+			}
+			if want_album && hints.len < limit {
+				for al in app.search_albums_fts(false, term, '', limit - hints.len, 0) {
+					mut h := map[string]json2.Any{}
+					jid := jf_album_id(al.artist, al.name)
+					h['ItemId'] = jid
+					h['Id'] = jid
+					h['Name'] = or_unknown(al.name, 'Album')
+					h['Type'] = 'MusicAlbum'
+					h['AlbumArtist'] = or_unknown(al.artist, 'Artist')
+					h['Artists'] = [json2.Any(or_unknown(al.artist, 'Artist'))]
+					h['ProductionYear'] = al.year
+					h['RunTimeTicks'] = i64(al.duration) * jf_ticks
+					h['ChildCount'] = al.songs
+					h['PrimaryImageTag'] = al.first_id.str()
+					hints << h
+					if hints.len >= limit {
+						break
+					}
+				}
+			}
+			if want_artist && hints.len < limit {
+				for ar in app.search_artists_fts('artist', term, limit - hints.len, 0) {
+					mut h := map[string]json2.Any{}
+					jid := jf_artist_id(ar.name)
+					h['ItemId'] = jid
+					h['Id'] = jid
+					h['Name'] = or_unknown(ar.name, 'Artist')
+					h['Type'] = 'MusicArtist'
+					h['SongCount'] = ar.albums
+					h['PrimaryImageTag'] = ar.first_id.str()
+					hints << h
+					if hints.len >= limit {
+						break
+					}
+				}
+			}
+		}
+		mut o := map[string]json2.Any{}
+		o['SearchHints'] = hints
+		o['TotalRecordCount'] = hints.len
+		return jf_send(mut ctx, o)
 	}
 	if a in ['views', 'userviews'] {
 		return jf_send(mut ctx, jf_page([app.jf_view()], 1, 0))
@@ -707,6 +862,27 @@ pub fn (mut app App) jellyfin(mut ctx Context, path string) veb.Result {
 		return jf_send(mut ctx, app.jf_playlist_summary(ps))
 	}
 	if a == 'items' {
+		if id == 'counts' {
+			song_cnt := app.fast_q_int('select count(*) from items where ${audio}', []) or { 0 }
+			movie_cnt := app.fast_q_int("select count(*) from items where missing = 0 and kind = 'video'",
+				[]) or { 0 }
+			album_cnt := app.albums_mat_count('', [])
+			artist_cnt := app.artists_mat_count('artist', '', [])
+			mut o := map[string]json2.Any{}
+			o['MovieCount'] = movie_cnt
+			o['SeriesCount'] = 0
+			o['EpisodeCount'] = 0
+			o['ArtistCount'] = artist_cnt
+			o['ProgramCount'] = 0
+			o['TrailerCount'] = 0
+			o['SongCount'] = song_cnt
+			o['AlbumCount'] = album_cnt
+			o['MusicVideoCount'] = 0
+			o['BoxSetCount'] = 0
+			o['BookCount'] = 0
+			o['ItemCount'] = song_cnt + movie_cnt
+			return jf_send(mut ctx, o)
+		}
 		if id == '' {
 			return jf_send(mut ctx, app.jf_items(p, q))
 		}

@@ -1,6 +1,7 @@
 module main
 
 import crypto.md5
+import crypto.sha256
 import encoding.base64
 import encoding.hex
 import net.urllib
@@ -87,7 +88,7 @@ fn sub_reply(mut ctx Context, q urllib.Values, payload Obj) veb.Result {
 	if (q.get('f') or { 'xml' }) == 'json' {
 		mut env := map[string]json2.Any{}
 		env['subsonic-response'] = json2.Any(map[string]json2.Any(r))
-		return ctx.send_response_to_client('application/json', json2.Any(env).json_str())
+		return send_json(mut ctx, json2.Any(env).json_str())
 	}
 	r['xmlns'] = 'http://subsonic.org/restapi'
 	return ctx.send_response_to_client('text/xml', '<?xml version="1.0" encoding="UTF-8"?>' +
@@ -113,7 +114,7 @@ fn sub_write_open(mut j JsonBuf, key string) {
 	j.raw('":')
 }
 
-fn sub_write_song(mut j JsonBuf, it &Item) {
+fn sub_write_song_ex(mut j JsonBuf, it &Item, starred_at i64) {
 	ext := os.file_ext(it.path).to_lower()
 	al_id := album_id(it.album_artist, it.album)
 	j.raw('{"id":"')
@@ -132,6 +133,10 @@ fn sub_write_song(mut j JsonBuf, it &Item) {
 	j.jstr(artist_id(it.artist))
 	j.raw(',"track":')
 	j.jint(it.track_no)
+	if it.disc_no > 0 {
+		j.raw(',"discNumber":')
+		j.jint(it.disc_no)
+	}
 	j.raw(',"year":')
 	j.jint(it.year)
 	j.raw(',"genre":')
@@ -146,6 +151,22 @@ fn sub_write_song(mut j JsonBuf, it &Item) {
 	j.jstr(ext.trim_left('.'))
 	j.raw(',"duration":')
 	j.jint(it.duration)
+	if it.bitrate > 0 {
+		j.raw(',"bitRate":')
+		j.jint(it.bitrate)
+	}
+	if it.sample_rate > 0 {
+		j.raw(',"samplingRate":')
+		j.jint(it.sample_rate)
+	}
+	if it.bit_depth > 0 {
+		j.raw(',"bitDepth":')
+		j.jint(it.bit_depth)
+	}
+	if it.channels > 0 {
+		j.raw(',"channelCount":')
+		j.jint(it.channels)
+	}
 	j.raw(',"path":')
 	j.jstr(os.file_name(it.path))
 	j.raw(',"type":"music","isVideo":false,"created":')
@@ -158,7 +179,27 @@ fn sub_write_song(mut j JsonBuf, it &Item) {
 		j.raw(',"played":')
 		j.jstr(iso(it.last_played))
 	}
+	if starred_at > 0 {
+		j.raw(',"starred":')
+		j.jstr(iso(starred_at))
+	}
+	if it.rg_track_gain != 0 || it.rg_album_gain != 0 || it.rg_track_peak != 0
+		|| it.rg_album_peak != 0 {
+		j.raw(',"replayGain":{"trackGain":')
+		j.jf64(it.rg_track_gain)
+		j.raw(',"albumGain":')
+		j.jf64(it.rg_album_gain)
+		j.raw(',"trackPeak":')
+		j.jf64(it.rg_track_peak)
+		j.raw(',"albumPeak":')
+		j.jf64(it.rg_album_peak)
+		j.byte(`}`)
+	}
 	j.byte(`}`)
+}
+
+fn sub_write_song(mut j JsonBuf, it &Item) {
+	sub_write_song_ex(mut j, it, 0)
 }
 
 fn sub_write_album_fields(mut j JsonBuf, al &Album, rated bool) {
@@ -395,7 +436,7 @@ fn (app &App) sub_album_list(rated bool, q urllib.Values) []Album {
 	offset := int_param(q, 'offset', 0, max_int)
 	return match kind {
 		'starred' {
-			[]Album{}
+			app.starred_albums(rated, size, offset)
 		}
 		'highest' {
 			if !rated || !app.has_ratings() {
@@ -453,7 +494,7 @@ fn (app &App) sub_album_list(rated bool, q urllib.Values) []Album {
 	}
 }
 
-fn song(it Item) json2.Any {
+fn song_ex(it Item, starred_at i64) json2.Any {
 	ext := os.file_ext(it.path).to_lower()
 	id_str := it.id.str()
 	al_id := album_id(it.album_artist, it.album)
@@ -467,6 +508,9 @@ fn song(it Item) json2.Any {
 	s['albumId'] = al_id
 	s['artistId'] = artist_id(it.artist)
 	s['track'] = it.track_no
+	if it.disc_no > 0 {
+		s['discNumber'] = it.disc_no
+	}
 	s['year'] = it.year
 	s['genre'] = it.genre
 	s['coverArt'] = id_str
@@ -474,6 +518,18 @@ fn song(it Item) json2.Any {
 	s['contentType'] = media_types[ext]
 	s['suffix'] = ext.trim_left('.')
 	s['duration'] = it.duration
+	if it.bitrate > 0 {
+		s['bitRate'] = it.bitrate
+	}
+	if it.sample_rate > 0 {
+		s['samplingRate'] = it.sample_rate
+	}
+	if it.bit_depth > 0 {
+		s['bitDepth'] = it.bit_depth
+	}
+	if it.channels > 0 {
+		s['channelCount'] = it.channels
+	}
 	s['path'] = os.file_name(it.path)
 	s['type'] = 'music'
 	s['isVideo'] = false
@@ -484,14 +540,30 @@ fn song(it Item) json2.Any {
 	if it.last_played > 0 {
 		s['played'] = iso(it.last_played)
 	}
+	if starred_at > 0 {
+		s['starred'] = iso(starred_at)
+	}
+	if it.rg_track_gain != 0 || it.rg_album_gain != 0 || it.rg_track_peak != 0
+		|| it.rg_album_peak != 0 {
+		mut rg := map[string]json2.Any{}
+		rg['trackGain'] = it.rg_track_gain
+		rg['albumGain'] = it.rg_album_gain
+		rg['trackPeak'] = it.rg_track_peak
+		rg['albumPeak'] = it.rg_album_peak
+		s['replayGain'] = rg
+	}
 	return s
+}
+
+fn song(it Item) json2.Any {
+	return song_ex(it, 0)
 }
 
 fn songs(items []Item) json2.Any {
 	return json2.Any(items.map(song(it)))
 }
 
-fn sub_album(rated bool, al Album) json2.Any {
+fn sub_album_ex(rated bool, al Album, starred_at i64) json2.Any {
 	al_id := album_id(al.artist, al.name)
 	ar_id := artist_id(al.artist)
 	al_name := or_unknown(al.name, 'Album')
@@ -520,7 +592,14 @@ fn sub_album(rated bool, al Album) json2.Any {
 	if al.last_played > 0 {
 		a['played'] = iso(al.last_played)
 	}
+	if starred_at > 0 {
+		a['starred'] = iso(starred_at)
+	}
 	return a
+}
+
+fn sub_album(rated bool, al Album) json2.Any {
+	return sub_album_ex(rated, al, 0)
 }
 
 fn albums_json(rated bool, list []Album) []json2.Any {
@@ -661,6 +740,7 @@ const sub_tag_fields = {
 	'genre':       'genre'
 	'year':        'year'
 	'track':       'track_no'
+	'discNumber':  'disc_no'
 }
 
 fn int_param(q urllib.Values, key string, default int, max int) int {
@@ -686,13 +766,21 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 	}
 	q := urllib.parse_query(raw) or { urllib.new_values() }
 
-	user := q.get('u') or { '' }
-	client := app.cached_app_by_name(user) or {
-		return sub_error(mut ctx, q, 40, 'Wrong username or password.')
-	}
-	if !sub_secret_ok(client.subsonic_password, q.get('p') or { '' }, q.get('t') or { '' },
-		q.get('s') or { '' }) {
-		return sub_error(mut ctx, q, 40, 'Wrong username or password.')
+	api_key := q.get('apiKey') or { '' }
+	mut client := ClientApp{}
+	if api_key != '' {
+		client = app.cached_app_by_token(sha256.hexhash(api_key)) or {
+			return sub_error(mut ctx, q, 44, 'Invalid API key.')
+		}
+	} else {
+		user := q.get('u') or { '' }
+		client = app.cached_app_by_name(user) or {
+			return sub_error(mut ctx, q, 40, 'Wrong username or password.')
+		}
+		if !sub_secret_ok(client.subsonic_password, q.get('p') or { '' }, q.get('t') or { '' },
+			q.get('s') or { '' }) {
+			return sub_error(mut ctx, q, 40, 'Wrong username or password.')
+		}
 	}
 	p := app.principal_for(client)
 
@@ -702,8 +790,8 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		'getCoverArt' { 'artwork:read' }
 		'getPlaylists', 'getPlaylist' { 'playlists:read' }
 		'createPlaylist', 'updatePlaylist', 'deletePlaylist' { 'playlists:write' }
-		'scrobble' { 'history:write' }
-		'setRating' { 'ratings:write' }
+		'scrobble', 'savePlayQueue' { 'history:write' }
+		'setRating', 'star', 'unstar' { 'ratings:write' }
 		'vlyraGetTags' { 'library:read' }
 		'vlyraSetTags' { '' }
 		'vlyraSetCoverArt' { 'artwork:write' }
@@ -734,13 +822,16 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			mut f := map[string]json2.Any{}
 			f['name'] = 'formPost'
 			f['versions'] = [json2.Any(1)]
+			mut ak := map[string]json2.Any{}
+			ak['name'] = 'apiKeyAuthentication'
+			ak['versions'] = [json2.Any(1)]
 			mut e := map[string]json2.Any{}
 			e['name'] = 'songLyrics'
 			e['versions'] = [json2.Any(1)]
 			mut t := map[string]json2.Any{}
 			t['name'] = 'vlyraTags'
 			t['versions'] = [json2.Any(1)]
-			out['openSubsonicExtensions'] = [json2.Any(f), e, t]
+			out['openSubsonicExtensions'] = [json2.Any(f), ak, e, t]
 		}
 		'getUser' {
 			mut u := map[string]json2.Any{}
@@ -770,9 +861,14 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		}
 		'getArtists', 'getIndexes' {
 			if is_json {
+				tag := '"v${app.catalog_version()}-${method}"'
+				if etag_matches(ctx, tag) {
+					return not_modified(mut ctx, tag, 'private, no-cache')
+				}
 				rows := app.artists_mat('artist', 'order by name collate nocase', [])
-				return ctx.send_response_to_client('application/json', encode_sub_artists_json(&rows,
-					method == 'getArtists'))
+				ctx.set_header(.etag, tag)
+				ctx.set_header(.cache_control, 'private, no-cache')
+				return send_json(mut ctx, encode_sub_artists_json(&rows, method == 'getArtists'))
 			}
 			mut a := map[string]json2.Any{}
 			a['ignoredArticles'] = ''
@@ -811,7 +907,7 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 				d['id'] = id
 				d['parent'] = artist_id(parts[0])
 				d['name'] = or_unknown(parts[1], 'Album')
-				d['child'] = songs(app.items('where ${audio} and ${album_match} order by track_no, title',
+				d['child'] = songs(app.items('where ${audio} and ${album_match} order by disc_no, track_no, title',
 					parts))
 				out['directory'] = d
 			} else {
@@ -828,12 +924,11 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			if rows.len == 0 {
 				return sub_error(mut ctx, q, 70, 'Album not found.')
 			}
-			tracks := app.items('where ${audio} and ${album_match} order by track_no, title',
+			tracks := app.items('where ${audio} and ${album_match} order by disc_no, track_no, title',
 				parts)
 			if is_json {
 				al := unsafe { &rows[0] }
-				return ctx.send_response_to_client('application/json', encode_sub_album_detail_json(al,
-					&tracks, rated))
+				return send_json(mut ctx, encode_sub_album_detail_json(al, &tracks, rated))
 			}
 			mut a := sub_album(rated, rows[0]).as_map()
 			a['song'] = songs(tracks)
@@ -842,8 +937,8 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		'getAlbumList', 'getAlbumList2' {
 			list := app.sub_album_list(rated, q)
 			if is_json {
-				return ctx.send_response_to_client('application/json', encode_sub_album_list_json(&list,
-					rated, method == 'getAlbumList'))
+				return send_json(mut ctx, encode_sub_album_list_json(&list, rated,
+					method == 'getAlbumList'))
 			}
 
 			mut l := map[string]json2.Any{}
@@ -856,10 +951,17 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			}] = l
 		}
 		'getGenres' {
-			rows := app.genres_mat()
 			if is_json {
-				return ctx.send_response_to_client('application/json', encode_sub_genres_json(&rows))
+				tag := '"v${app.catalog_version()}-genres"'
+				if etag_matches(ctx, tag) {
+					return not_modified(mut ctx, tag, 'private, no-cache')
+				}
+				rows := app.genres_mat()
+				ctx.set_header(.etag, tag)
+				ctx.set_header(.cache_control, 'private, no-cache')
+				return send_json(mut ctx, encode_sub_genres_json(&rows))
 			}
+			rows := app.genres_mat()
 			mut list := []json2.Any{}
 			for gr in rows {
 				mut g := map[string]json2.Any{}
@@ -879,18 +981,50 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		'getRandomSongs' {
 			items := app.random_items(int_param(q, 'size', 10, 500))
 			if is_json {
-				return ctx.send_response_to_client('application/json', encode_sub_random_songs_json(&items))
+				return send_json(mut ctx, encode_sub_random_songs_json(&items))
 			}
 			mut r := map[string]json2.Any{}
 			r['song'] = songs(items)
 			out['randomSongs'] = r
 		}
 		'getStarred', 'getStarred2' {
+			s_items := app.starred_items()
+			s_albums := app.starred_albums(rated, 500, 0)
+			s_artists := app.starred_artists()
+			item_at := app.starred_map('item')
+			album_at := app.starred_map('album')
+			artist_at := app.starred_map('artist')
+			mut artists_arr := []json2.Any{cap: s_artists.len}
+			for ar in s_artists {
+				mut ao := map[string]json2.Any{}
+				ao['id'] = artist_id(ar.name)
+				ao['name'] = or_unknown(ar.name, 'Artist')
+				ao['albumCount'] = ar.albums
+				ao['coverArt'] = ar.first_id.str()
+				if at := artist_at[ar.name] {
+					if at > 0 {
+						ao['starred'] = iso(at)
+					}
+				}
+				artists_arr << ao
+			}
+			mut albums_arr := []json2.Any{cap: s_albums.len}
+			for al in s_albums {
+				albums_arr << sub_album_ex(rated, al, album_at['${al.artist}\x1f${al.name}'])
+			}
+			mut songs_arr := []json2.Any{cap: s_items.len}
+			for it in s_items {
+				songs_arr << song_ex(it, item_at[it.id.str()])
+			}
+			mut st := map[string]json2.Any{}
+			st['artist'] = artists_arr
+			st['album'] = albums_arr
+			st['song'] = songs_arr
 			out[if method == 'getStarred' {
 				'starred'
 			} else {
 				'starred2'
-			}] = map[string]json2.Any{}
+			}] = st
 		}
 		'search2', 'search3' {
 			q_text := (q.get('query') or { '' }).trim('"').trim_space()
@@ -902,7 +1036,7 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			artist_off := int_param(q, 'artistOffset', 0, max_int)
 			song_rows := if song_cnt > 0 {
 				if q_text == '' {
-					app.items('where ${audio} order by artist collate nocase, album collate nocase, track_no limit ? offset ?', [
+					app.items('where ${audio} order by artist collate nocase, album collate nocase, disc_no, track_no limit ? offset ?', [
 						song_cnt.str(),
 						song_off.str(),
 					])
@@ -938,8 +1072,8 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 				[]ArtistRow{}
 			}
 			if is_json {
-				return ctx.send_response_to_client('application/json', encode_sub_search_json(&song_rows,
-					&album_rows, &artist_rows, rated, method == 'search2'))
+				return send_json(mut ctx, encode_sub_search_json(&song_rows, &album_rows,
+					&artist_rows, rated, method == 'search2'))
 			}
 			mut r := map[string]json2.Any{}
 			r['song'] = songs(song_rows)
@@ -995,7 +1129,7 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 		'getPlaylists' {
 			sums := app.playlist_summaries()
 			if is_json {
-				return ctx.send_response_to_client('application/json', encode_sub_playlists_json(&sums))
+				return send_json(mut ctx, encode_sub_playlists_json(&sums))
 			}
 			mut l := map[string]json2.Any{}
 			l['playlist'] = sums.map(sub_playlist_summary(it))
@@ -1041,6 +1175,47 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 				}
 			}
 		}
+		'star', 'unstar' {
+			sub_star(mut app, p, q, method == 'star') or {
+				return sub_error(mut ctx, q, 70, err.msg())
+			}
+		}
+		'savePlayQueue' {
+			ids := q.get_all('id').map(it.int()).filter(it > 0)
+			cur := (q.get('current') or { '0' }).int()
+			pos := (q.get('position') or { '0' }).i64()
+			app.save_play_queue(p, ids, cur, pos, p.name) or {
+				return sub_error(mut ctx, q, 0, err.msg())
+			}
+		}
+		'getPlayQueue' {
+			if pq := app.get_play_queue() {
+				id_strs := pq.item_ids.map(it.str())
+				mut by_id := map[int]Item{}
+				for it in app.items('where ${audio} and id in (${qmarks(id_strs.len)})',
+					id_strs) {
+					by_id[it.id] = it
+				}
+				mut entries := []Item{}
+				for item_id in pq.item_ids {
+					if item_id in by_id {
+						entries << by_id[item_id]
+					}
+				}
+				if entries.len > 0 {
+					mut qobj := map[string]json2.Any{}
+					if pq.current_id > 0 {
+						qobj['current'] = pq.current_id.str()
+					}
+					qobj['position'] = pq.position_ms
+					qobj['username'] = pq.changed_by
+					qobj['changed'] = iso(pq.updated_at)
+					qobj['changedBy'] = pq.changed_by
+					qobj['entry'] = songs(entries)
+					out['playQueue'] = qobj
+				}
+			}
+		}
 		'vlyraGetTags' {
 			it := app.item(id.int()) or { return sub_error(mut ctx, q, 70, 'Song not found.') }
 			mut t := map[string]json2.Any{}
@@ -1052,6 +1227,7 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 			t['genre'] = it.genre
 			t['year'] = it.year
 			t['track'] = it.track_no
+			t['discNumber'] = it.disc_no
 			if p.can('lyrics:read') {
 				t['lyrics'] = app.lyrics(it.id)
 			}
@@ -1112,4 +1288,36 @@ pub fn (mut app App) subsonic(mut ctx Context, endpoint string) veb.Result {
 	}
 
 	return sub_reply(mut ctx, q, out)
+}
+
+fn sub_star(mut app App, p Principal, q urllib.Values, starred bool) ! {
+	for raw_id in q.get_all('id') {
+		if raw_id.starts_with('al-') {
+			parts := decode_id(raw_id)
+			if parts.len != 2 {
+				return error('Album not found.')
+			}
+			app.set_star(p, 'album', '${parts[0]}\x1f${parts[1]}', starred)!
+		} else if raw_id.starts_with('ar-') {
+			parts := decode_id(raw_id)
+			app.set_star(p, 'artist', parts[0], starred)!
+		} else {
+			it := app.item(raw_id.int()) or { return error('Song not found.') }
+			app.set_star(p, 'item', it.id.str(), starred)!
+		}
+	}
+	for aid in q.get_all('albumId') {
+		parts := decode_id(aid)
+		if !aid.starts_with('al-') || parts.len != 2 {
+			return error('Album not found.')
+		}
+		app.set_star(p, 'album', '${parts[0]}\x1f${parts[1]}', starred)!
+	}
+	for arid in q.get_all('artistId') {
+		parts := decode_id(arid)
+		if !arid.starts_with('ar-') || parts.len == 0 {
+			return error('Artist not found.')
+		}
+		app.set_star(p, 'artist', parts[0], starred)!
+	}
 }

@@ -27,24 +27,28 @@ pub mut:
 	apps_by_token map[string]ClientApp
 	apps_by_name  map[string]ClientApp
 	last_seen     map[int]i64
-	last_seen_db  map[int]i64
-	has_ratings   bool
+	last_seen_db   map[int]i64
+	has_ratings    bool
+	scan_media_dir string
+	scan_dirs      map[string]i64
 }
 
 pub struct App {
 pub mut:
-	db        sqlite.DB
-	reads     []sqlite.DB
-	next      u64
-	data_dir  string
-	ffprobe   string
-	ffmpeg    string
-	scanning  bool
-	cache     &AppCache = unsafe { nil }
-	server_id string
-	web_html  string
-	web_css_s string
-	web_js_s  string
+	db          sqlite.DB
+	reads       []sqlite.DB
+	read_pool   []&ReadConn
+	next        u64
+	data_dir    string
+	ffprobe     string
+	ffmpeg      string
+	scanning    bool
+	catalog_gen u64
+	cache       &AppCache = unsafe { nil }
+	server_id   string
+	web_html    string
+	web_css_s   string
+	web_js_s    string
 }
 
 fn new_app(db_path string, data_dir string) !&App {
@@ -53,11 +57,12 @@ fn new_app(db_path string, data_dir string) !&App {
 	c.tx_mu.init()
 	mut app := &App{
 		// fullmutex: veb serves requests on several threads over this one connection.
-		db:        sqlite.connect_full(db_path, [.readwrite, .create, .fullmutex], '')!
-		data_dir:  data_dir
-		ffprobe:   os.find_abs_path_of_executable('ffprobe') or { '' }
-		ffmpeg:    os.find_abs_path_of_executable('ffmpeg') or { '' }
-		cache:     c
+		db:          sqlite.connect_full(db_path, [.readwrite, .create, .fullmutex], '')!
+		data_dir:    data_dir
+		ffprobe:     os.find_abs_path_of_executable('ffprobe') or { '' }
+		ffmpeg:      os.find_abs_path_of_executable('ffmpeg') or { '' }
+		catalog_gen: 1
+		cache:       c
 		server_id: md5.hexhash('vlyra\x1f${data_dir}')
 		web_html:  web_index.to_string()
 		web_css_s: web_css.to_string()
@@ -79,6 +84,9 @@ fn new_app(db_path string, data_dir string) !&App {
 		app.db.exec('select 1 from sqlite_master limit 1')!
 		n := if runtime.nr_cpus() * 2 > 4 { runtime.nr_cpus() * 2 } else { 4 }
 		for _ in 0 .. n {
+			app.read_pool << open_read_conn(db_path)!
+		}
+		for _ in 0 .. 2 {
 			mut r := sqlite.connect_full(db_path, [.readonly, .fullmutex], '')!
 			r.busy_timeout(5000)
 			r.exec('pragma query_only = on')!

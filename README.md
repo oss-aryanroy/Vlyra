@@ -42,10 +42,11 @@ with `--target source`.
 | File          | Role                                                                 |
 | ------------- | -------------------------------------------------------------------- |
 | `core.v`      | The single source of truth: items, playlists, plays, attributed writes |
+| `sql_fast.v`  | Direct C `sqlite3_stmt` prepared-statement cache and read connection pool |
 | `auth.v`      | Apps, scopes, admin sessions, protocol switches                        |
-| `scan.v`      | Indexes the media folder (native tag parsing, `ffprobe` fallback)      |
-| `tags.v`      | In-process tag readers for mp3/flac/m4a/m4b/ogg/oga/opus/wav/aac; aiff/wma/wv/ape/mka go to `ffprobe` |
-| `api.v`       | Native JSON API and media/artwork streaming                            |
+| `scan.v`      | Indexes the media folder (directory-mtime `scan_fast` skip, native tags, `ffprobe` fallback) |
+| `tags.v`      | In-process tag, artwork, lyrics, ReplayGain, and audio-tech readers for mp3/flac/m4a/m4b/ogg/oga/opus/wav/aac; aiff/wma/wv/ape/mka go to `ffprobe` |
+| `api.v`       | Native JSON API (`ETag`/`304`, `gzip`) and media/artwork streaming     |
 | `subsonic.v`  | Subsonic / OpenSubsonic translation layer; owns no data                |
 | `jellyfin.v`  | Jellyfin translation layer for music clients; owns no data             |
 | `scrobble.v`  | Forwards every listen to ListenBrainz and/or Last.fm                   |
@@ -92,7 +93,7 @@ Send `Authorization: Bearer <token>`. Errors are `{"error": "..."}` with 400,
 | `GET /api/v1/me`                      | none              | who am I, which scopes                        |
 | `GET /api/v1/items?q=&limit=&offset=` | `library:read`    | `{items, total}`                              |
 | `GET /api/v1/items/:id`               | `library:read`    |                                               |
-| `PATCH /api/v1/items/:id`             | `library:write`   | any of `title artist album genre year track_no tags` |
+| `PATCH /api/v1/items/:id`             | `library:write`   | any of `title artist album genre year track_no disc_no tags` |
 | `GET /api/v1/items/:id/stream`        | `library:read`    | supports `Range`                              |
 | `GET` / `PUT /api/v1/items/:id/lyrics`  | `lyrics:read` / `lyrics:write`   | `{"text": "..."}`, plain or LRC  |
 | `GET` / `PUT /api/v1/items/:id/artwork` | `artwork:read` / `artwork:write` | raw JPEG, PNG, WebP or GIF body  |
@@ -112,10 +113,12 @@ Admin-only endpoints used by the web UI (`/apps`, `/activity`, `/settings`,
 ## Subsonic
 
 Server URL is the Vlyra address; username is the app name; password is the
-app's Subsonic password. Supported: browsing (ID3 and folder style), album
-lists (including highest rated), search, streaming, cover art, lyrics (plain
-and synced), playlists, album ratings (`setRating` on an album id), scrobbling.
-JSON and XML.
+app's Subsonic password, or pass the app's API token via OpenSubsonic `apiKey`
+authentication (`apiKeyAuthentication`). Supported: browsing (ID3 and folder
+style), album lists (including highest rated and starred), starring (`star`,
+`unstar`, `getStarred`, `getStarred2`), play queues (`savePlayQueue`,
+`getPlayQueue`), search, streaming, cover art, lyrics (plain and synced),
+playlists, album ratings (`setRating` on an album id), scrobbling. JSON and XML.
 
 Vlyra also adds its own `vlyraTags` extension, so a Subsonic client can edit a
 song with the password it already has: `vlyraGetTags?id=` (`library:read`;
@@ -130,10 +133,12 @@ other; files on disk are never rewritten.
 Server URL is the Vlyra address; username is the app name; password is the
 app's API token (which also becomes the client's Jellyfin access token, so no
 extra secret is stored). Supported for music: libraries, albums, artists,
-tracks, search, genres, streaming, cover art, lyrics, playlists, and reporting
-listens. As in Jellyfin itself, cover images are served without sign-in while
-the protocol is switched on. It has been exercised with scripted requests, not
-yet with real client apps, and video libraries are not exposed.
+tracks, search (`/Search/Hints`), item counts (`/Items/Counts`), genres,
+favorites (`FavoriteItems` / `UserFavoriteItems` and `IsFavorite` filter),
+streaming, cover art, lyrics, playlists, and reporting listens. As in Jellyfin
+itself, cover images are served without sign-in while the protocol is switched
+on. It has been exercised with scripted requests, not yet with real client
+apps, and video libraries are not exposed.
 
 ## Scrobbling
 
@@ -196,3 +201,52 @@ Vlyra container footprint: **6.4 MiB** RSS. No errors on either server:
 At 3.9–6.9 Gbps of sustained direct-stream throughput, outbound network
 bandwidth—not CPU or RAM—is the limiting factor on this VPS (roughly ~830
 concurrent 1,173 kbps FLAC listeners per Gbps of upload).
+
+## Runtime & scanner benchmarks
+
+Measured locally on an **Apple M5** (10 cores, 16 GiB RAM) with a native C
+HTTP/1.1 keep-alive benchmarker (8 threads, warmed up, 3–5 interleaved rounds,
+0 errors).
+
+### Scanner, artwork & HTTP caching
+
+Sample library: **5,000 tracks** (mixed MP3, FLAC, M4A) across **250 albums**,
+with 5 embedded 400×400 JPEG covers tested for artwork extraction and dedup.
+
+| Benchmark | Before | After | Change |
+| --- | --- | --- | --- |
+| Cold initial scan (5,000 tracks) | 212.0 ms | 188.5 ms | −11.1% |
+| Idle watch tick (`scan` → `scan_fast`) | 20.34 ms | 0.509 ms | 40.0× faster |
+| Cold embedded artwork extraction (50 tracks, 5 albums) | 1,112.9 ms (`ffmpeg`) | 16.06 ms (in-process) | 69.3× faster |
+| Artwork disk usage (50 tracks, 5 shared covers) | 1,034,350 B | 23,099 B | −97.8% (44.8× smaller) |
+| Gzip wire size: `/api/v1/items?limit=1000` | 340,547 B | 21,206 B | −93.8% |
+| Gzip wire size: `/api/v1/albums` | 89,088 B | 6,164 B | −93.1% |
+| Gzip wire size: `/rest/getArtists?f=json` | 8,007 B | 1,290 B | −83.9% |
+
+Conditional `304 Not Modified` throughput (8 threads, 0-byte body):
+
+| Endpoint | Throughput |
+| --- | --- |
+| `/api/v1/albums` | 96,440 req/s |
+| `/rest/getArtists?f=json` | 76,267 req/s |
+| `/api/v1/items/:id/artwork` | 58,042 req/s |
+
+### Direct C `sqlite3_stmt` cache & protocol endpoints
+
+Sample library: **5,000 tracks**, **1,000 albums**, **200 artists** (8 threads,
+3 interleaved rounds, median req/s).
+
+| Endpoint | Before | After | Change |
+| --- | --- | --- | --- |
+| `/api/v1/albums` (1,000 albums) | 1,025 req/s | 8,401 req/s | 8.2× |
+| `/api/v1/items?limit=1000` | 833 req/s | 2,678 req/s | 3.2× |
+| `/api/v1/items?limit=200` | 7,794 req/s | 10,747 req/s | +37.9% |
+| `/rest/getArtists?f=json` | 11,199 req/s | 13,505 req/s | +20.6% |
+| `/rest/search3?query=Artist&f=json` | 9,569 req/s | 13,579 req/s | +41.9% |
+| `/Items/Counts` | — | 18,489 req/s | new |
+| `/Search/Hints?searchTerm=Artist` | — | 9,047 req/s | new |
+| `/rest/getStarred2?f=json` | — | 6,136 req/s | new |
+
+Post-load RSS on Apple M5 dropped from **80.9 MB** to **76.9 MB**; on the
+6-vCPU ARM64 VPS in Docker (`deploy-vlyra-1`, 177-FLAC library), idle RSS after
+migrating and indexing the new audio/tech fields is **10.7 MiB**.

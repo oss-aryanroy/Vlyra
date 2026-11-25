@@ -38,29 +38,67 @@ struct C.statx_timestamp {
 
 struct C.statx {
 	stx_mask  u32
+	stx_size  u64
 	stx_btime C.statx_timestamp
+	stx_mtime C.statx_timestamp
 }
 
 fn C.statx(dirfd int, path &char, flags int, mask u32, buf &C.statx) int
 
-// When the file arrived on this disk: its birth time where the filesystem
-// records one, else its mtime. Never later than now (bad clocks, future mtimes).
-fn file_added(path string) i64 {
-	mut t := os.file_last_mod_unix(path)
+struct FileMeta {
+	size     i64
+	mtime    i64
+	added_at i64
+}
+
+// Single-syscall stat gathering size, mtime, and birth time (when the filesystem records one).
+fn file_meta(path string) FileMeta {
+	now := time.now().unix()
+	mut size := i64(-1)
+	mut mtime := i64(0)
+	mut btime := i64(0)
 	$if linux {
 		mut sx := C.statx{}
-		if C.statx(C.AT_FDCWD, &char(path.str), 0, C.STATX_BTIME, &sx) == 0
-			&& sx.stx_mask & C.STATX_BTIME != 0 && sx.stx_btime.tv_sec > 0 {
-			t = sx.stx_btime.tv_sec
+		if C.statx(C.AT_FDCWD, &char(path.str), 0, C.STATX_MTIME | C.STATX_SIZE | C.STATX_BTIME,
+			&sx) == 0 {
+			if sx.stx_mask & C.STATX_SIZE != 0 {
+				size = i64(sx.stx_size)
+			}
+			if sx.stx_mask & C.STATX_MTIME != 0 {
+				mtime = sx.stx_mtime.tv_sec
+			}
+			if sx.stx_mask & C.STATX_BTIME != 0 && sx.stx_btime.tv_sec > 0 {
+				btime = sx.stx_btime.tv_sec
+			}
 		}
 	} $else $if macos {
 		mut st := C.stat{}
-		if unsafe { C.stat(&char(path.str), &st) } == 0 && st.st_birthtime > 0 {
-			t = st.st_birthtime
+		if unsafe { C.stat(&char(path.str), &st) } == 0 {
+			size = i64(st.st_size)
+			mtime = i64(st.st_mtime)
+			if st.st_birthtime > 0 {
+				btime = st.st_birthtime
+			}
 		}
 	}
-	now := time.now().unix()
-	return if t > 0 && t < now { t } else { now }
+	if size < 0 {
+		size = i64(os.file_size(path))
+	}
+	if mtime == 0 {
+		mtime = os.file_last_mod_unix(path)
+	}
+	added_src := if btime > 0 { btime } else { mtime }
+	return FileMeta{
+		size:     size
+		mtime:    mtime
+		added_at: if added_src > 0 && added_src < now { added_src } else { now }
+	}
+}
+
+// When the file arrived on this disk: its birth time where the filesystem
+// records one, else its mtime. Never later than now (bad clocks, future mtimes).
+fn file_added(path string) i64 {
+	return file_meta(path).added_at
 }
 
 // os.exec, not os.Process: Process forks and runs V code in the child, which
@@ -71,18 +109,41 @@ fn run(exe string, args []string) string {
 	return os.exec(argv).output
 }
 
-fn probe_file(ffprobe string, path string) Item {
-	ext := os.file_ext(path).to_lower()
-	mut it := Item{
-		path:     path
-		kind:     if media_types[ext].starts_with('video') { 'video' } else { 'audio' }
-		title:    os.file_name(path).all_before_last('.')
-		size:     i64(os.file_size(path))
-		added_at: file_added(path)
-		mtime:    os.file_last_mod_unix(path)
+struct ScanFile {
+	path     string
+	size     i64
+	mtime    i64
+	added_at i64
+	recent   bool
+}
+
+struct ProbeResult {
+	item   Item
+	lyrics string
+}
+
+fn probe_file(ffprobe string, f ScanFile) ProbeResult {
+	ext := os.file_ext(f.path).to_lower()
+	meta := if f.mtime != 0 && f.added_at != 0 {
+		FileMeta{
+			size:     f.size
+			mtime:    f.mtime
+			added_at: f.added_at
+		}
+	} else {
+		file_meta(f.path)
 	}
+	mut it := Item{
+		path:     f.path
+		kind:     if media_types[ext].starts_with('video') { 'video' } else { 'audio' }
+		title:    os.file_name(f.path).all_before_last('.')
+		size:     meta.size
+		mtime:    meta.mtime
+		added_at: meta.added_at
+	}
+	mut lyrics := ''
 	if it.kind == 'audio' {
-		if nt := native_tags(path, ext) {
+		if nt := native_tags_sized(f.path, ext, meta.size) {
 			it.duration = nt.duration
 			if nt.title != '' {
 				it.title = nt.title
@@ -93,23 +154,72 @@ fn probe_file(ffprobe string, path string) Item {
 			it.genre = nt.genre
 			it.year = nt.date.int()
 			it.track_no = nt.track.int()
+			it.disc_no = nt.disc.int()
+			it.bitrate = nt.bitrate
+			it.sample_rate = nt.sample_rate
+			it.bit_depth = nt.bit_depth
+			it.channels = nt.channels
+			it.rg_track_gain = nt.rg_track_gain
+			it.rg_album_gain = nt.rg_album_gain
+			it.rg_track_peak = nt.rg_track_peak
+			it.rg_album_peak = nt.rg_album_peak
+			lyrics = nt.lyrics
 			if nt.duration > 0 {
-				return it
+				return ProbeResult{
+					item:   it
+					lyrics: lyrics
+				}
 			}
 		}
 	}
 	if ffprobe == '' {
-		return it
+		return ProbeResult{
+			item:   it
+			lyrics: lyrics
+		}
 	}
 	out := run(ffprobe, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams',
-		path])
-	root := (json2.decode[json2.Any](out) or { return it }).as_map()
-	format := (root['format'] or { return it }).as_map()
+		f.path])
+	root := (json2.decode[json2.Any](out) or {
+		return ProbeResult{
+			item:   it
+			lyrics: lyrics
+		}
+	}).as_map()
+	format := (root['format'] or {
+		return ProbeResult{
+			item:   it
+			lyrics: lyrics
+		}
+	}).as_map()
 	it.duration = int((format['duration'] or { json2.Any('0') }).str().f64())
 	mut tags := map[string]string{}
 	mut sources := [format]
 	for s in (root['streams'] or { json2.Any([]json2.Any{}) }).as_array() {
-		sources << s.as_map()
+		sm := s.as_map()
+		sources << sm
+		if (sm['codec_type'] or { json2.Any('') }).str() == 'audio' {
+			if it.sample_rate == 0 {
+				it.sample_rate = (sm['sample_rate'] or { json2.Any('0') }).int()
+			}
+			if it.channels == 0 {
+				it.channels = (sm['channels'] or { json2.Any('0') }).int()
+			}
+			if it.bit_depth == 0 {
+				bprs := (sm['bits_per_raw_sample'] or { json2.Any('0') }).int()
+				it.bit_depth = if bprs > 0 {
+					bprs
+				} else {
+					(sm['bits_per_sample'] or { json2.Any('0') }).int()
+				}
+			}
+			if it.bitrate == 0 {
+				it.bitrate = (sm['bit_rate'] or { json2.Any('0') }).int() / 1000
+			}
+		}
+	}
+	if it.bitrate == 0 {
+		it.bitrate = (format['bit_rate'] or { json2.Any('0') }).int() / 1000
 	}
 	for src in sources {
 		for k, v in (src['tags'] or { continue }).as_map() {
@@ -140,27 +250,125 @@ fn probe_file(ffprobe string, path string) Item {
 	if tags['track'].int() != 0 {
 		it.track_no = tags['track'].int()
 	}
-	return it
+	if tags['disc'].int() != 0 && it.disc_no == 0 {
+		it.disc_no = tags['disc'].int()
+	}
+	if it.rg_track_gain == 0 && tags['replaygain_track_gain'] != '' {
+		it.rg_track_gain = parse_rg_db(tags['replaygain_track_gain'])
+	}
+	if it.rg_album_gain == 0 && tags['replaygain_album_gain'] != '' {
+		it.rg_album_gain = parse_rg_db(tags['replaygain_album_gain'])
+	}
+	if it.rg_track_peak == 0 && tags['replaygain_track_peak'] != '' {
+		it.rg_track_peak = tags['replaygain_track_peak'].trim_space().f64()
+	}
+	if it.rg_album_peak == 0 && tags['replaygain_album_peak'] != '' {
+		it.rg_album_peak = tags['replaygain_album_peak'].trim_space().f64()
+	}
+	if lyrics == '' && tags['lyrics'] != '' {
+		lyrics = tags['lyrics']
+	}
+	return ProbeResult{
+		item:   it
+		lyrics: lyrics
+	}
 }
 
-fn probe_worker(ffprobe string, paths chan string, out chan Item) {
+fn probe_worker(ffprobe string, files chan ScanFile, out chan ProbeResult) {
 	for {
-		path := <-paths or { return }
-		out <- probe_file(ffprobe, path)
+		f := <-files or { return }
+		out <- probe_file(ffprobe, f)
 	}
 }
 
-fn push_all(paths chan string, fresh []string) {
-	for p in fresh {
-		paths <- p
+fn push_all(files chan ScanFile, fresh []ScanFile) {
+	for f in fresh {
+		files <- f
 	}
-	paths.close()
+	files.close()
+}
+
+fn walk_media(root string, mut files []ScanFile, mut dirs map[string]i64, now i64) bool {
+	dirs[root] = os.file_last_mod_unix(root)
+	entries := os.ls(root) or { return false }
+	mut had_recent := false
+	for name in entries {
+		if name.starts_with('.') {
+			continue
+		}
+		p := os.join_path(root, name)
+		if os.is_dir(p) {
+			if walk_media(p, mut files, mut dirs, now) {
+				had_recent = true
+			}
+			continue
+		}
+		if os.file_ext(name).to_lower() !in media_types {
+			continue
+		}
+		m := file_meta(p)
+		if m.mtime <= now && now - m.mtime < 2 {
+			had_recent = true
+			files << ScanFile{
+				path:   p
+				size:   m.size
+				mtime:  m.mtime
+				recent: true
+			}
+			continue
+		}
+		files << ScanFile{
+			path:     p
+			size:     m.size
+			mtime:    m.mtime
+			added_at: m.added_at
+		}
+	}
+	return had_recent
 }
 
 fn (mut app App) watch() {
+	mut tick := 0
 	for {
-		app.scan()
+		if tick % 12 == 0 {
+			app.scan()
+		} else {
+			app.scan_fast()
+		}
+		tick++
 		time.sleep(5 * time.second)
+	}
+}
+
+fn (mut app App) scan_fast() {
+	dir := app.get('media_dir')
+	if dir == '' || !os.is_dir(dir) {
+		return
+	}
+	if app.get('tags_version') != tag_reader_version || app.get('added_from_files') == '' {
+		app.scan()
+		return
+	}
+	mut cached_dir := ''
+	mut cached_dirs := map[string]i64{}
+	unsafe {
+		mut c := app.cache
+		c.mu.rlock()
+		cached_dir = c.scan_media_dir
+		if cached_dir == dir && c.scan_dirs.len > 0 {
+			cached_dirs = c.scan_dirs.clone()
+		}
+		c.mu.runlock()
+	}
+	if cached_dir != dir || cached_dirs.len == 0 {
+		app.scan()
+		return
+	}
+	for d, prev_mtime in cached_dirs {
+		if !os.is_dir(d) || os.file_last_mod_unix(d) != prev_mtime {
+			app.scan()
+			return
+		}
 	}
 }
 
@@ -184,19 +392,18 @@ fn (mut app App) scan() {
 	}
 	reread_all := app.get('tags_version') != tag_reader_version
 	now := time.now().unix()
+	mut files := []ScanFile{}
+	mut dirs := map[string]i64{}
+	had_recent := walk_media(dir, mut files, mut dirs, now)
 	mut seen := map[string]bool{}
-	mut work := []string{}
-	for path in os.walk_ext(dir, '') {
-		if os.file_ext(path).to_lower() !in media_types || os.file_name(path).starts_with('.') {
+	mut work := []ScanFile{}
+	for f in files {
+		seen[f.path] = true
+		if f.recent {
 			continue
 		}
-		seen[path] = true
-		mtime := os.file_last_mod_unix(path)
-		if mtime <= now && now - mtime < 2 {
-			continue
-		}
-		if path !in known || reread_all || mtimes[path] != mtime {
-			work << path
+		if f.path !in known || reread_all || mtimes[f.path] != f.mtime {
+			work << f
 		}
 	}
 	mut changed := false
@@ -214,23 +421,28 @@ fn (mut app App) scan() {
 		} else if workers > 16 {
 			workers = 16
 		}
-		paths_ch := chan string{cap: 2 * workers}
-		items_ch := chan Item{cap: 2 * workers}
+		files_ch := chan ScanFile{cap: 2 * workers}
+		items_ch := chan ProbeResult{cap: 2 * workers}
 		for _ in 0 .. workers {
-			spawn probe_worker(app.ffprobe, paths_ch, items_ch)
+			spawn probe_worker(app.ffprobe, files_ch, items_ch)
 		}
-		spawn push_all(paths_ch, work)
+		spawn push_all(files_ch, work)
 		unsafe {
 			mut c := app.cache
 			c.tx_mu.lock()
 		}
 		app.db.exec('begin') or { eprintln('scan: ${err}') }
 		for i, _ in work {
-			it := <-items_ch
+			res := <-items_ch
+			it := res.item
 			if it.path in known {
-				mut sets := ['duration = ?', 'size = ?', 'mtime = ?']
-				mut vals := [it.duration.str(), it.size.str(),
-					it.mtime.str()]
+				mut sets := ['duration = ?', 'size = ?', 'mtime = ?', 'bitrate = ?',
+					'sample_rate = ?', 'bit_depth = ?', 'channels = ?', 'rg_track_gain = ?',
+					'rg_album_gain = ?', 'rg_track_peak = ?', 'rg_album_peak = ?']
+				mut vals := [it.duration.str(), it.size.str(), it.mtime.str(),
+					it.bitrate.str(), it.sample_rate.str(), it.bit_depth.str(),
+					it.channels.str(), it.rg_track_gain.str(), it.rg_album_gain.str(),
+					it.rg_track_peak.str(), it.rg_album_peak.str()]
 				for col, val in {
 					'title':        it.title
 					'artist':       it.artist
@@ -239,6 +451,7 @@ fn (mut app App) scan() {
 					'genre':        it.genre
 					'year':         it.year.str()
 					'track_no':     it.track_no.str()
+					'disc_no':      it.disc_no.str()
 				} {
 					if col !in edited[it.path] {
 						sets << '${col} = ?'
@@ -256,6 +469,12 @@ fn (mut app App) scan() {
 					eprintln('scan: ${it.path}: ${err}')
 					0
 				}
+			}
+			if res.lyrics != '' {
+				app.db.exec_param_many('insert or ignore into lyrics (item_id, text) values ((select id from items where path = ?), ?)', [
+					it.path,
+					res.lyrics,
+				]) or {}
 			}
 			if (i + 1) % 500 == 0 {
 				app.db.exec('commit') or { eprintln('scan: ${err}') }
@@ -328,5 +547,17 @@ fn (mut app App) scan() {
 	if changed {
 		app.rebuild_catalog()
 		app.db.exec('pragma optimize') or {}
+	}
+	unsafe {
+		mut c := app.cache
+		c.mu.lock()
+		if had_recent {
+			c.scan_media_dir = ''
+			c.scan_dirs.clear()
+		} else {
+			c.scan_media_dir = dir
+			c.scan_dirs = dirs.clone()
+		}
+		c.mu.unlock()
 	}
 }
